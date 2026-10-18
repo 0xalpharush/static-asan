@@ -1,0 +1,475 @@
+From b7340f09ae655e797d81fd9a766781ba757f13f0 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Thu, 10 Sep 2026 21:34:42 +0000
+Subject: [PATCH] [compiler-rt] sealed init: reserve the shadow first, sized to
+ the detected address space
+
+The sealed runtime mapped its shadow with MAP_FIXED after two mappings the
+kernel had placed wherever it liked, and after asking nothing: sealed init
+reads no /proc/self/maps, so patch 0012 had MemoryRangeIsAvailable answer yes
+unasked.  Measured, x86_64, the sealed start-up before this:
+
+  mmap(NULL, 65536, ...)                                   = 0x7fb06cafe000
+  mmap(NULL, 3727360, ...)                                 = 0x7fb06c770000
+  mmap(0x7fff7000, 268435456, ..., MAP_FIXED|...)          = 0x7fff7000
+  mmap(0x2008fff7000, 15392894357504, ..., MAP_FIXED|...)  = 0x2008fff7000
+  mmap(0x8fff7000, 2199023255552, PROT_NONE, MAP_FIXED|..) = 0x8fff7000
+
+The specification these binaries are verified against admits every placement
+the kernel can make, under both mmap layouts and any address-space size, so
+a grant inside the future shadow is a run the model contains; and on riscv64
+hardware it is a run Linux makes, since the legacy layout's base is
+PAGE_ALIGN(2^39 / 3) = 0x2aaaaab000 on every Sv mode -- inside the Sv48
+shadow gap -- and `ulimit -s unlimited` selects that layout.  A program whose
+first mapping landed there had it covered by the gap and faulted before main.
+
+Two changes, one function each.
+
+SealedReserveShadow runs from __asan_init before InitializeFlags, so before
+the runtime's first allocation, and maps the low shadow, the gap and the high
+shadow with MAP_FIXED_NOREPLACE, which the kernel refuses with EEXIST where
+MAP_FIXED would have replaced.  Each result is accepted only if it is the
+address asked for, which also covers a kernel old enough to read the flag as
+a hint.  Nothing the runtime maps afterwards can land inside, since the
+kernel places an unhinted mapping only in free space; what a program starts
+with -- its segments, the stack, the vDSO, the TLS block musl maps -- is a
+collision the reservation refuses rather than one it hides, and a refusal at
+start-up is the spin of patch 0015.  InitializeShadowMemory then leaves the
+three ranges alone, so a sealed start-up makes the same three shadow mmaps,
+each with one more flag, first instead of third.  protect_shadow_gap is
+pinned to 1 by SealFlags, the gap having been protected before the flag
+could be read.
+
+SealedTopOfMemory, riscv64: the sealed runtime pinned Sv48 outright, so that
+one binary refused an Sv39 kernel -- and under Sv39 the 14TiB high shadow is
+not mappable at all.  It now keeps the constant offset, 0x7fff8000, which is
+valid under Sv39 as well (the shadow of a 256GiB space is a 32GiB band above
+it), and reads the size of the space off the frame __asan_init started on,
+(1 << (msb(frame) + 1)) - 1: 0x7fffffffffff under Sv48 and 0x3fffffffff under
+Sv39, the same function of the same thing the unsealed runtime computes, at a
+fixed point.  The rule this implements is that the layout is a function of
+the initial stack pointer, deterministic in the model, which is what makes
+reading the frame admissible where reading /proc was not.  One runtime, one
+offset, the same instrumented code, two layouts:
+
+  Sv48, top 0x7fffffffffff                Sv39, top 0x3fffffffff
+  [0x10007fff8000, 0x7fffffffffff] HighMem     [0x087fff8000, 0x3fffffffff]
+  [0x02008fff7000, 0x10007fff7fff] HighShadow  [0x018fff7000, 0x087fff7fff]
+  [0x00008fff7000, 0x02008fff6fff] ShadowGap   [0x0008fff7000, 0x018fff6fff]
+  [0x00007fff8000, 0x00008fff6fff] LowShadow   the same
+  [0x000000000000, 0x00007fff7fff] LowMem      the same
+
+The arithmetic is held for both tops by static_asserts in sanitizer_sealed.h
+-- each region ends before the next begins, HighMem exists, the gap is
+exactly the shadow of the shadow -- because no Sv39 machine runs this
+project's suite.  kSealedMaxUserVirtualAddress stays the Sv48 constant and
+is what SANITIZER_MMAP_RANGE_SIZE is held equal to: it sizes the internal
+allocator's bytemap for the largest space, and a detected Sv39 uses a prefix.
+x86_64 keeps its constant top, having no Sv39 analogue.
+
+Measured after, x86_64 and riscv64 under qemu-user alike: the three shadow
+mmaps come first, MAP_NORESERVE|MAP_FIXED_NOREPLACE, then the 64KiB and
+3727360-byte mappings; a page mapped at 0x80000000 by a constructor ahead of
+the sanitizer's own leaves the sealed build spinning with its first
+reservation refused EEXIST, where the unsealed build finds the page in its
+maps check and dies with the interleave report (x86_64) or probes its shadow
+elsewhere and runs (riscv64).  The suite's sealed_collide and
+sealed_shadow_layout are those two measurements.
+---
+ compiler-rt/lib/asan/asan_flags.cpp           |   4 +
+ compiler-rt/lib/asan/asan_internal.h          |   7 +
+ compiler-rt/lib/asan/asan_rtl.cpp             |  19 ++-
+ compiler-rt/lib/asan/asan_shadow_setup.cpp    |  85 +++++++++++
+ .../lib/sanitizer_common/sanitizer_linux.cpp  |   8 +-
+ .../lib/sanitizer_common/sanitizer_sealed.h   | 140 ++++++++++++------
+ 6 files changed, 211 insertions(+), 52 deletions(-)
+
+diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
+index 4898ef75c..c7bbc66a4 100644
+--- a/compiler-rt/lib/asan/asan_flags.cpp
++++ b/compiler-rt/lib/asan/asan_flags.cpp
+@@ -285,6 +285,10 @@ static void SealFlags() {
+   cf.allocator_release_to_os_interval_ms = -1;
+   cf.abort_on_error = true;
+   OverrideCommonFlags(cf);
++  // The shadow gap was protected before these flags were parsed
++  // (SealedReserveShadow), so the flag that would leave it open is pinned to
++  // what already happened.
++  flags()->protect_shadow_gap = true;
+ }
+ 
+ void InitializeFlags() {
+diff --git a/compiler-rt/lib/asan/asan_internal.h b/compiler-rt/lib/asan/asan_internal.h
+index 06dfc4b17..993b76a55 100644
+--- a/compiler-rt/lib/asan/asan_internal.h
++++ b/compiler-rt/lib/asan/asan_internal.h
+@@ -74,6 +74,13 @@ void NORETURN ShowStatsAndAbort();
+ 
+ // asan_shadow_setup.cpp
+ void InitializeShadowMemory();
++// asan_rtl.cpp: kHighMemEnd from GetMaxUserVirtualAddress(); called twice in a
++// sealed run (see SealedReserveShadow) and idempotent.
++void InitializeHighMemEnd();
++// asan_shadow_setup.cpp: in a sealed run, the shadow and its gap, reserved
++// before the runtime's first allocation, with MAP_FIXED_NOREPLACE.  A no-op
++// in an unsealed run.
++void SealedReserveShadow();
+ 
+ // asan_malloc_linux.cpp / asan_malloc_mac.cpp
+ void ReplaceSystemMalloc();
+diff --git a/compiler-rt/lib/asan/asan_rtl.cpp b/compiler-rt/lib/asan/asan_rtl.cpp
+index 5b42aff8c..a0e86b39d 100644
+--- a/compiler-rt/lib/asan/asan_rtl.cpp
++++ b/compiler-rt/lib/asan/asan_rtl.cpp
+@@ -376,9 +376,9 @@ static void CheckSealedAddressSpace() {
+       (void *)kHighMemEnd, (void *)sp);
+ #if SANITIZER_RISCV64
+   Printf(
+-      "A sealed riscv64 binary carries the Sv48 layout, whose stack top is "
+-      "0x800000000000.  A kernel running Sv39 puts it at 0x4000000000 instead, "
+-      "and this binary cannot run there.\n");
++      "A sealed riscv64 binary reads the size of its address space off the "
++      "frame its runtime started on, so this cannot happen unless that frame "
++      "moved; see SealedTopOfMemory.\n");
+ #else
+   Printf(
+       "A sealed binary carries the top of memory its architecture's default "
+@@ -387,7 +387,7 @@ static void CheckSealedAddressSpace() {
+   internal__exit(common_flags()->exitcode);
+ }
+ 
+-static void InitializeHighMemEnd() {
++void InitializeHighMemEnd() {
+ #if !ASAN_FIXED_MAPPING
+   kHighMemEnd = GetMaxUserVirtualAddress();
+   // Increase kHighMemEnd to make sure it's properly
+@@ -473,6 +473,17 @@ static bool AsanInitInternal() {
+   uptr init_frame;
+   SealedSetInitFrame(reinterpret_cast<uptr>(&init_frame));
+ 
++  // Sealed init reserves the shadow and its gap here, before the flag parser
++  // takes the runtime's first page: every mapping the runtime makes from this
++  // point on is placed by the kernel outside the reservation, where before
++  // this the first two were placed anywhere and the shadow was then mapped
++  // over the range with MAP_FIXED, unchecked.  The size of the space is read
++  // off the frame recorded just above.  See SealedReserveShadow.
++  if (SealedInit()) {
++    InitializeHighMemEnd();
++    SealedReserveShadow();
++  }
++
+   CacheBinaryName();
+ 
+   // Initialize flags. This must be done early, because most of the
+diff --git a/compiler-rt/lib/asan/asan_shadow_setup.cpp b/compiler-rt/lib/asan/asan_shadow_setup.cpp
+index f12222413..88575109b 100644
+--- a/compiler-rt/lib/asan/asan_shadow_setup.cpp
++++ b/compiler-rt/lib/asan/asan_shadow_setup.cpp
+@@ -18,7 +18,14 @@
+ 
+ #  include "asan_internal.h"
+ #  include "asan_mapping.h"
++#  include "sanitizer_common/sanitizer_posix.h"
+ #  include "sanitizer_common/sanitizer_sealed.h"
++#  if SANITIZER_LINUX
++#    include <sys/mman.h>
++#    ifndef MAP_FIXED_NOREPLACE
++#      define MAP_FIXED_NOREPLACE 0x100000
++#    endif
++#  endif
+ 
+ namespace __asan {
+ 
+@@ -53,6 +60,73 @@ static void MaybeReportLinuxPIEBug() {
+ #endif
+ }
+ 
++#  if SANITIZER_LINUX
++// Set by SealedReserveShadow once the three ranges are mapped, and what makes
++// InitializeShadowMemory below leave them alone.
++static bool sealed_shadow_reserved;
++
++static void SealedReserveRange(uptr beg, uptr end, int prot) {
++  uptr size = end - beg + 1;
++  uptr res = internal_mmap(reinterpret_cast<void *>(beg), size, prot,
++                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
++                               MAP_FIXED_NOREPLACE,
++                           -1, 0);
++  // Three answers are not the range: an errno (EEXIST is a mapping already
++  // there, ENOMEM a space too small for the layout), a mapping placed
++  // elsewhere by a kernel that predates the flag and read it as a hint, and
++  // -- not possible for MAP_FIXED_NOREPLACE, but the test is the same -- any
++  // other address.  All are the runtime failing to get memory for itself at
++  // start-up, and take the one path that has: see
++  // SealedHangOnAllocationFailure.
++  if (res != beg)
++    SealedHangOnAllocationFailure();
++  DecreaseTotalMmap(size);  // Not counted against mmap_limit_mb, as ever.
++}
++#  endif
++
++// The shadow and its gap, reserved before the runtime's first allocation.
++//
++// The unsealed runtime reserves them from InitializeShadowMemory, after the
++// flag parser and the internal allocator have each taken a mapping at no
++// fixed address, and it maps them with MAP_FIXED after asking /proc/self/maps
++// whether the range is free.  Sealed init reads no /proc, so patch 0012 had
++// that question answer yes unasked, which left the MAP_FIXED calls unchecked:
++// any mapping the kernel had placed in the range -- the two runtime mappings
++// before it, or anything the program started with -- was covered by the
++// shadow without a word, and the specification these binaries are verified
++// against admits every placement the kernel could make, under either mmap
++// layout and any address-space size.  So the sealed runtime reserves first,
++// with MAP_FIXED_NOREPLACE, which the kernel refuses with EEXIST where
++// MAP_FIXED would have replaced.  Nothing the runtime maps afterwards can
++// land inside, since the kernel places an unhinted mapping only in free
++// space, and what a program starts with -- its own segments, the stack, the
++// vDSO, the TLS block musl maps -- is a collision the reservation refuses
++// rather than one it hides.
++//
++// It runs before InitializeFlags, so the three ranges are the ones the
++// defaults name, and protect_shadow_gap is pinned to 1 afterwards
++// (SealFlags).  The syscalls are the same three mmaps InitializeShadowMemory
++// would have made, in ascending order, each with one more flag: a sealed
++// start-up makes no new syscall, the mappings just come first.
++void SealedReserveShadow() {
++#  if SANITIZER_LINUX
++  if (!SealedInit())
++    return;
++#    if SANITIZER_RISCV64
++  // The offset asan_mapping.h reads MEM_TO_SHADOW's constant out of on this
++  // architecture, set here so that the k* bounds below are the layout's.
++  // FindDynamicShadowStart answers the same constant later.
++  __asan_shadow_memory_dynamic_address = kSealedShadowOffset;
++#    endif
++  // kHighMemEnd is set: the caller ran InitializeHighMemEnd first.
++  uptr shadow_start = kLowShadowBeg - GetMmapGranularity();
++  SealedReserveRange(shadow_start, kLowShadowEnd, PROT_READ | PROT_WRITE);
++  SealedReserveRange(kShadowGapBeg, kShadowGapEnd, PROT_NONE);
++  SealedReserveRange(kHighShadowBeg, kHighShadowEnd, PROT_READ | PROT_WRITE);
++  sealed_shadow_reserved = true;
++#  endif
++}
++
+ void InitializeShadowMemory() {
+   // Set the shadow memory address to uninitialized.
+   __asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
+@@ -86,6 +160,17 @@ void InitializeShadowMemory() {
+ 
+   if (Verbosity()) PrintAddressSpaceLayout();
+ 
++#  if SANITIZER_LINUX
++  // A sealed run reserved these before anything else (SealedReserveShadow),
++  // and what follows would map over its own reservation with MAP_FIXED: three
++  // syscalls that change nothing.  The invariant the fixed-mapping branch
++  // checks is checked here too.
++  if (sealed_shadow_reserved) {
++    CHECK_EQ(kShadowGapEnd, kHighShadowBeg - 1);
++    return;
++  }
++#  endif
++
+   if (full_shadow_is_available) {
+     // mmap the low shadow plus at least one page at the left.
+     if (kLowShadowBeg)
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+index fdc75d460..225c5d3bf 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+@@ -1267,10 +1267,12 @@ uptr GetMaxVirtualAddress() {
+ #  if SANITIZER_RISCV64
+   // The answer below is read off the address of the current frame, which makes
+   // the size of ASan's shadow reservation a function of the initial stack
+-  // pointer.  Sealed mode answers with the Sv48 constant instead; see
+-  // sanitizer_sealed.h for which constant and why that one.
++  // pointer.  Sealed mode reads it off the frame __asan_init started on, which
++  // is the same function of the same thing at a fixed point; see
++  // SealedTopOfMemory in sanitizer_sealed.h for why that is admissible and for
++  // the two layouts it names.
+   if (SealedInit())
+-    return kSealedMaxUserVirtualAddress;
++    return SealedTopOfMemory();
+ #  endif
+ #  if SANITIZER_NETBSD && defined(__x86_64__)
+   return 0x7f7ffffff000ULL;  // (0x00007f8000000000 - PAGE_SIZE)
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+index 30c673770..66eb3e0f1 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+@@ -32,10 +32,14 @@
+ //     is killed by a signal the program could not have chosen as an exit
+ //     status, where an exit_group(exitcode) is an event its plain twin could
+ //     also have made.
+-//   - on riscv64, the shadow offset and the size of the shadow reservation are
+-//     constants rather than being derived from the address of the current
+-//     frame, and the constants are the Sv48 layout's.  See
+-//     kSealedMaxUserVirtualAddress below.
++//   - the shadow and its gap are reserved before any other mapping the
++//     runtime makes, with MAP_FIXED_NOREPLACE, so that a mapping the kernel
++//     placed earlier is a refusal rather than something the shadow silently
++//     covers; and on riscv64 the shadow offset is a constant while the size
++//     of the address space is read off the frame __asan_init started on,
++//     one runtime serving Sv39 and Sv48 alike.  See kSealedShadowOffset and
++//     SealedTopOfMemory below, and SealedReserveShadow in
++//     asan_shadow_setup.cpp.
+ //   - an allocation the runtime cannot get for itself -- an mmap the kernel
+ //     refuses, a shadow it cannot reserve, an internal allocator with nothing
+ //     left -- is a spin, forever, making no syscall: not a diagnostic and not
+@@ -196,62 +200,109 @@ inline void SealedHangOnAllocationFailure() {
+   for (;;) __asm__ __volatile__("" ::: "memory");
+ }
+ 
++// The frame the runtime's initialization started on, recorded by __asan_init
++// before it calls anything, and 0 until it does.  Declared here because the
++// riscv64 address-space detection below reads it; what else reads it, and why
++// it has to be that frame, is with kSealedMainStackSize further down.
++extern uptr sealed_init_frame;
++
+ #if SANITIZER_RISCV64
+ // riscv64 is the one architecture here whose shadow offset is not a constant:
+ // asan_mapping.h selects ASAN_SHADOW_OFFSET_DYNAMIC for it, the offset comes
+ // out of an mmap probe sized by GetMaxVirtualAddress(), and that function
+ // answers `(1 << (msb(current frame) + 1)) - 1` because RISC-V has three
+ // address space layouts (Sv39, Sv48, Sv57) and nothing tells a process which
+-// one it is running under.  So the size of the shadow reservation is a
+-// function of the initial stack pointer.
++// one it is running under.
+ //
+-// Sealed mode pins both to the Sv48 layout, which is the one Linux/riscv64
+-// gives a process on any kernel with VA_BITS >= 48: STACK_TOP is
+-// DEFAULT_MAP_WINDOW = 1 << (MMAP_VA_BITS - 1), and MMAP_VA_BITS saturates at
+-// 48, so the stack top is 0x800000000000 under Sv48 and Sv57 alike and the top
+-// user address is 0x7fffffffffff.  The offset is the one asan_mapping.h already
+-// uses for every other 47-bit user address space, x86_64's included:
++// Sealed mode pins the offset and detects the size.  The offset is the one
++// asan_mapping.h uses for every other 47-bit user address space, x86_64's
++// included, and it is valid under Sv39 as well: the shadow of a 256GiB space
++// is a 32GiB band above the offset.  The size is read off the frame
++// __asan_init started on -- sealed_init_frame, recorded before anything else
++// -- the way the unsealed runtime reads it off the current frame.  Linux puts
++// the stack at the top of the window an unhinted mmap allocates from,
++// STACK_TOP = DEFAULT_MAP_WINDOW = 1 << (MMAP_VA_BITS - 1), so the frame's
++// magnitude names the layout: 1 << 38 under Sv39, 1 << 47 under Sv48, and
++// MMAP_VA_BITS saturates at 48, so Sv57 answers as Sv48.  The initial stack
++// pointer is one of the things a caller reasoning about these binaries
++// quantifies over, and the rule this implements is that the layout is a
++// function of it -- deterministic in the model -- which is what makes reading
++// the frame admissible where reading /proc was not.  An earlier version of
++// this pinned Sv48 outright, so that the same binary refused an Sv39 kernel;
++// one runtime that serves both is what was asked for instead.
+ //
+-//   || `[0x10007fff8000, 0x7fffffffffff]` || HighMem    ||
+-//   || `[0x02008fff7000, 0x10007fff7fff]` || HighShadow ||
+-//   || `[0x00008fff7000, 0x02008fff6fff]` || ShadowGap  ||
+-//   || `[0x00007fff8000, 0x00008fff6fff]` || LowShadow  ||
+-//   || `[0x000000000000, 0x00007fff7fff]` || LowMem     ||
++// One runtime, one offset, the same instrumented code, two layouts:
+ //
+-// Sv39 is the other plausible pin, and it is the wrong one here even though it
+-// is what much riscv64 hardware runs and it would make the reservation 4GB
+-// rather than 14TB.  A caller reasoning about these binaries quantifies the
+-// initial stack pointer over the window a kernel can put it in, and on an Sv48
+-// kernel every such stack address is above an Sv39 ceiling -- so an Sv39-sealed
+-// binary would take the diagnostic path below on every admissible run, which is
+-// worse than not sealing at all.  Changing this pin is these two constants and
+-// the mapping table above; nothing else here depends on which it is.
+-const uptr kSealedMaxUserVirtualAddress = 0x7fffffffffffULL;
++//   Sv48, top 0x7fffffffffff                Sv39, top 0x3fffffffff
++//   [0x10007fff8000, 0x7fffffffffff] HighMem     [0x087fff8000, 0x3fffffffff]
++//   [0x02008fff7000, 0x10007fff7fff] HighShadow  [0x018fff7000, 0x087fff7fff]
++//   [0x00008fff7000, 0x02008fff6fff] ShadowGap   [0x0008fff7000, 0x018fff6fff]
++//   [0x00007fff8000, 0x00008fff6fff] LowShadow   the same
++//   [0x000000000000, 0x00007fff7fff] LowMem      the same
++//
++// which is a 14TiB reservation under Sv48 and 32GiB under Sv39.  Where it is
++// made, and why before anything else, is SealedReserveShadow in
++// asan_shadow_setup.cpp.
+ const uptr kSealedShadowOffset = 0x7fff8000ULL;
++const uptr kSealedSv39TopOfMemory = 0x3fffffffffULL;
++const uptr kSealedSv48TopOfMemory = 0x7fffffffffffULL;
+ 
+-// The pin above is one statement about the address space, and
+-// SANITIZER_MMAP_RANGE_SIZE is the same statement made in sanitizer_platform.h,
+-// where it sizes the first level of the bytemap the internal allocator uses to
+-// find a region's size class.  They were allowed to disagree once -- the pin
+-// said Sv48 and the range size said 56 bits -- and the cost of that was not
+-// wrongness but 128MiB of .bss where 256KiB was called for.  A header that
+-// sanitizer_platform.h could include would be the tidier fix; it includes
+-// nothing, by design, so this is what holds the two together: move the pin and
+-// this stops the build until the other moves with it.
+-//
+-// It is an equality and not just the soundness bound (>=), deliberately.  The
+-// bound is what makes the allocator correct, and a range size larger than the
+-// pin would satisfy it; but a binary that pins Sv48 and then reserves a bytemap
+-// for an address space it has just said it will refuse to run in is carrying
+-// the cost of a generality the seal has already spent.
++inline uptr SealedTopOfMemory() {
++  // With the frame at 0x7ff... this is Sv48's top; at 0x3ff..., Sv39's.  Any
++  // other magnitude is a kernel this runtime was not written for, and the
++  // reservation is where that is found out: a layout the arithmetic below
++  // holds for is reserved, one it does not hold for collides or is refused,
++  // and either way nothing is mapped over something else.
++  return (1ULL << ((63 - __builtin_clzll(sealed_init_frame)) + 1)) - 1;
++}
++
++// The layout arithmetic, mirrored from asan_mapping.h at shadow scale 3 and
++// held for both layouts at compile time: each region ends before the next
++// begins, HighMem exists, and the gap is exactly the shadow of the shadow.
++// This is the check an Sv39 machine would make at start-up, made here because
++// no Sv39 machine runs this project's suite.
++constexpr uptr SealedMemToShadow(uptr mem) {
++  return (mem >> 3) + kSealedShadowOffset;
++}
++constexpr bool SealedLayoutHolds(uptr top) {
++  return
++      // LowMem, LowShadow, ShadowGap, HighShadow, HighMem, in that order.
++      SealedMemToShadow(kSealedShadowOffset - 1) + 1 <=            // gap begins
++          SealedMemToShadow(SealedMemToShadow(top) + 1) - 1 &&     // gap ends
++      SealedMemToShadow(SealedMemToShadow(top) + 1) <=             // high shadow
++          SealedMemToShadow(top) &&
++      SealedMemToShadow(top) < SealedMemToShadow(top) + 1 &&        // HighMem begins
++      SealedMemToShadow(top) + 1 < top &&                           // and exists
++      // The gap is the shadow of [LowShadowBeg, HighShadowEnd].
++      SealedMemToShadow(kSealedShadowOffset) ==
++          SealedMemToShadow(kSealedShadowOffset - 1) + 1 &&
++      SealedMemToShadow(SealedMemToShadow(top)) ==
++          SealedMemToShadow(SealedMemToShadow(top) + 1) - 1;
++}
++static_assert(SealedLayoutHolds(kSealedSv48TopOfMemory),
++              "the sealed shadow offset does not lay out an Sv48 space");
++static_assert(SealedLayoutHolds(kSealedSv39TopOfMemory),
++              "the sealed shadow offset does not lay out an Sv39 space");
++
++// The largest address space this runtime runs in.  It is what sizes the first
++// level of the bytemap the internal allocator uses to find a region's size
++// class, through SANITIZER_MMAP_RANGE_SIZE in sanitizer_platform.h, and a
++// smaller detected space uses a prefix of that map.  They were allowed to
++// disagree once -- the pin said Sv48 and the range size said 56 bits -- and
++// the cost of that was not wrongness but 128MiB of .bss where 256KiB was
++// called for.  A header that sanitizer_platform.h could include would be the
++// tidier fix; it includes nothing, by design, so this is what holds the two
++// together: move one and this stops the build until the other moves with it.
++const uptr kSealedMaxUserVirtualAddress = kSealedSv48TopOfMemory;
+ static_assert(kSealedMaxUserVirtualAddress == SANITIZER_MMAP_RANGE_SIZE - 1,
+-              "sealed riscv64 pins the top user address, and "
++              "sealed riscv64 names the largest address space it runs in, and "
+               "SANITIZER_MMAP_RANGE_SIZE names the same address space; they "
+               "have to be the same number");
+ #endif
+ 
+-// The frame the runtime's initialization started on, recorded by __asan_init
+-// before it calls anything, and 0 until it does.
++// sealed_init_frame, declared above: the frame the runtime's initialization
++// started on, recorded by __asan_init before it calls anything, and 0 until
++// it does.
+ //
+ // It has to be that frame and not the one that reads it.  What reads it is
+ // GetThreadStackTopAndBottom, and what the bound it computes has to contain is a
+@@ -263,7 +314,6 @@ static_assert(kSealedMaxUserVirtualAddress == SANITIZER_MMAP_RANGE_SIZE - 1,
+ // what moves the initial stack pointer.  A bound taken on the way in, above
+ // every frame that will be checked against it, cannot have that argument made
+ // about it.
+-extern uptr sealed_init_frame;
+ void SealedSetInitFrame(uptr frame);
+ 
+ // The window sealed mode calls the main thread's stack, ending at the frame

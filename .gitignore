@@ -1,0 +1,13 @@
+# upstream source checkouts, pinned by ref in the build, not vendored
+/musl/
+/llvm-project/
+
+# local build scratch
+/work/
+
+# build outputs
+*.o
+*.a
+
+# OS junk
+.DS_Store

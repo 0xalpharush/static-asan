@@ -1,0 +1,70 @@
+From 396f49d65d0a0535389d2503e7a7e14a46b96f34 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 19 Aug 2026 02:19:27 +0000
+Subject: [PATCH] [sanitizer_common] return mktime's result as the libc's
+ time_t
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The mktime interceptor is declared to return `long`.  Everywhere this
+runtime has been built until now that is the width of the libc's time_t, so
+the declaration was right by coincidence rather than by construction, and the
+coincidence does not hold on a 32-bit musl: there time_t is 64 bits and `long`
+is 32.
+
+What that costs is a wrong answer in an ordinary program, not a missed report.
+The interceptor is what the caller's `mktime` resolves to, and the caller was
+compiled against musl's prototype, so it reads a 64-bit return value out of
+the register pair the ABI puts one in -- r0 and r1 on Arm.  The interceptor
+returned 32 bits, in r0, and left r1 holding whatever the last call it made
+put there.  So under ASan on armv7, mktime returns a timestamp whose high half
+is unrelated to the time; a program that compares two of them, or converts one
+back, gets nonsense, and nothing anywhere says a sanitizer changed the answer.
+It is also truncated on the way in to the runtime's own `res != -1` test,
+though that one is harmless.
+
+__sanitizer_time_t is the type this file already keeps for exactly this, and
+it is already what it says musl's is -- `long long` for a Linux libc that is
+not glibc.  On both 64-bit targets the two spellings are the same width and
+this changes nothing about the code generated.  It is the only interceptor in
+this file that returns a time_t as a `long`; the rest of the time-related ones
+return an int or write through a pointer.
+
+conformance/checks/interceptor-signatures.py is what found it, on the first
+armv7 run, by comparing the declaration against musl's -- the same way it
+found the gethostbyaddr length.  On the two 64-bit targets it had nothing to
+report, because there is nothing there to report.
+---
+ .../sanitizer_common_interceptors.inc                 | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+index bbd7a1c13..3041bec2a 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+@@ -1447,7 +1447,14 @@ INTERCEPTOR(char *, asctime_r, __sanitizer_tm *tm, char *result) {
+   }
+   return res;
+ }
+-INTERCEPTOR(long, mktime, __sanitizer_tm *tm) {
++// The return type is the libc's time_t and not `long`.  They are the same width
++// wherever time_t is a long, which is every 64-bit target and a 32-bit one whose
++// libc kept a 32-bit time_t, and on a 32-bit libc with a 64-bit time_t -- musl
++// on every one of its 32-bit architectures -- they are not: the interceptor
++// returns 32 bits where mktime returned 64, the caller reads the register pair
++// its own prototype says the value is in, and the high half of a timestamp is
++// whatever the interceptor left there.
++INTERCEPTOR(__sanitizer_time_t, mktime, __sanitizer_tm *tm) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, mktime, tm);
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, &tm->tm_sec, sizeof(tm->tm_sec));
+@@ -1457,7 +1464,7 @@ INTERCEPTOR(long, mktime, __sanitizer_tm *tm) {
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, &tm->tm_mon, sizeof(tm->tm_mon));
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, &tm->tm_year, sizeof(tm->tm_year));
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, &tm->tm_isdst, sizeof(tm->tm_isdst));
+-  long res = REAL(mktime)(tm);
++  __sanitizer_time_t res = REAL(mktime)(tm);
+   if (res != -1) unpoison_tm(ctx, tm);
+   return res;
+ }

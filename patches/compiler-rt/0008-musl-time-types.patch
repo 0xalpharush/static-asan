@@ -1,0 +1,102 @@
+From 194be70c4db41221602eed01e10ca0b382335bf2 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 19 Aug 2026 01:33:58 +0000
+Subject: [PATCH] [sanitizer_common] describe musl's timeval and timespec where
+ time_t is 64 bits
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: musl has a 64-bit time_t on every architecture, 32-bit ones included, and
+this file knows that: __sanitizer_time_t is already `long long` for a Linux
+libc that is not glibc.  The two types beside it were not given the same
+treatment, and on a 64-bit target nothing shows, because there `long` is 64
+bits and the padding a 32-bit target needs is not there.
+
+suseconds_t is the reachable half.  musl declares it `_Int64` one line below
+time_t in alltypes.h, with no per-architecture override anywhere in its tree,
+so it is 8 bytes on armv7 while `typedef long __sanitizer_suseconds_t` makes
+compiler-rt's copy 4.  struct timeval still comes out the same total on both
+sides -- 16, because the 4-byte field is followed by 4 bytes of alignment
+padding -- so CHECK_TYPE_SIZE passes and nothing upstream notices.  The
+setitimer interceptor is what reads the field, and it reads it by name and
+by width rather than taking the whole struct, deliberately: itimerval has
+padding a caller may legitimately leave uninitialized, so the interceptor
+marks the four real fields one at a time,
+
+  COMMON_INTERCEPTOR_READ_RANGE(ctx, &nv->it_value.tv_usec,
+                                sizeof(__sanitizer_suseconds_t));
+
+and on a 32-bit musl target that marks 4 bytes of an 8-byte field.  The
+offsets are right, so this is an under-read and not a wrong-address read: a
+caller who passes a struct timeval whose last four bytes are out of bounds is
+not reported.  Widening the typedef for musl fixes it and is a no-op on the
+64-bit targets, where `long` and `long long` are the same width.
+
+tv_nsec is the other half and is not reached today.  musl spells struct
+timespec with an anonymous bit-field of padding beside a plain `long`
+tv_nsec, on whichever side of it the byte order puts the high half of a
+64-bit word; compiler-rt describes the field and the padding together as one
+u64.  The totals match again, 16 either way, and all three uses of
+__sanitizer_timespec in this tree are sizeof -- timespec_get's write range and
+its internal_memcpy, and timer_gettime/timer_settime through
+__sanitizer_itimerspec -- so no code reads the field and no program
+misbehaves.  It is described here anyway because the description is what the
+next interceptor would be written against, and reading that u64 on a
+little-endian 32-bit target returns the caller's uninitialized padding as the
+top half of a nanosecond count, which is exactly the failure this file's
+struct msghdr had before it was given musl's layout.
+
+The padding musl uses here has no name -- it is an anonymous bit-field, unlike
+the __pad1 and __pad2 in its msghdr -- so the field named __pad below is a name
+this file invents for it, and conformance/checks/struct-layouts.allow says so.
+---
+ .../sanitizer_platform_limits_posix.h         | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+index e7c99b6c6..646236ab6 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+@@ -396,12 +396,41 @@ typedef long long __sanitizer_time_t;
+ typedef long __sanitizer_time_t;
+ #endif
+ 
++#if SANITIZER_MUSL
++// musl's suseconds_t is 64 bits on every architecture it has, like the time_t
++// above it -- the two are declared one line apart in its alltypes.h.  On a
++// 64-bit target `long` is already that wide and this says nothing new; on a
++// 32-bit one it is the difference between describing struct timeval and
++// describing a struct that is not musl's.
++typedef long long __sanitizer_suseconds_t;
++#else
+ typedef long __sanitizer_suseconds_t;
++#endif
+ 
++#if SANITIZER_MUSL && SANITIZER_WORDSIZE == 32
++// musl's tv_nsec is a long with a padding word beside it, not a 64-bit field.
++// Its time_t is 64 bits on a 32-bit target, so the struct has to be padded to
++// the size the kernel expects, and the padding goes on whichever side of the
++// field the byte order puts the high half of a 64-bit word.  Describing the two
++// together as one 64-bit tv_nsec is the same mistake this file used to make
++// about musl's msg_iovlen: the padding is part of no interface and a caller has
++// no reason to initialize it.
++struct __sanitizer_timespec {
++  __sanitizer_time_t tv_sec; /* seconds */
++#  if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++  int __pad;
++  long tv_nsec; /* nanoseconds */
++#  else
++  long tv_nsec; /* nanoseconds */
++  int __pad;
++#  endif
++};
++#else
+ struct __sanitizer_timespec {
+   __sanitizer_time_t tv_sec; /* seconds */
+   u64 tv_nsec;               /* nanoseconds */
+ };
++#endif
+ 
+ struct __sanitizer_itimerspec {
+   struct __sanitizer_timespec it_interval; /* timer period */

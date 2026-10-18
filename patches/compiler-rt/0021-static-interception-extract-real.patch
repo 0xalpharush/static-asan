@@ -1,0 +1,168 @@
+From beed54eb859dfa6b25c0b224bac020322f5a0c1b Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Sat, 12 Sep 2026 21:56:06 +0000
+Subject: [PATCH] [compiler-rt] static interception: extract the real function
+ at parse time
+
+An interceptor reaches the function it replaced through __real_<func>, a
+weak reference that ld --wrap=<func> resolves against the archive member
+defining <func>.  Six openssl and openssh targets died at address 0 with no
+report, sealed and unsealed alike (gdb: pc = 0, ra in
+___interceptor_getentropy; llvm-nm: `w getentropy`): OpenSSL declares
+getentropy weak and tests it for null before calling, nothing else in those
+programs references it, and under --wrap the program's reference is
+rewritten to the wrapper, which exists, so the program called it and
+REAL(getentropy) was null.
+
+How lld fills REAL in: it resolves __real_<func> by re-adding <func> as an
+undefined symbol with <func>'s CURRENT binding (addWrappedSymbols), after
+every input has been parsed.  The program's weak reference has by then met
+libc.a's lazy <func> and left it lazy with weak binding, so the re-added
+undefined is weak and extracts nothing.  No binding on __real_<func>
+changes that: strong, the link fails on the undefined <func> instead
+(measured), and it also fails the one link the toolchain's suite makes on
+purpose without the wrap list, so weak it stays.  -u <func> beside every
+--wrap would extract, but -u is a garbage-collection root, and rooting all
+380 wrapped functions puts back the libc that --gc-sections removed
+(measured: -u getentropy alone puts its body in a program that never calls
+it).
+
+So each DEFINE_REAL now emits an address-sized word holding <func> in a
+section of its own, marked SHF_EXCLUDE.  The linker reads the object's
+symbol table before it decides anything about its sections, so the
+undefined name extracts the member at parse time, before any wrapping; the
+section it discards on sight, so the word is never laid out, relocated or
+written, and sizes are unchanged in every link.  The first shape of this
+was an ordinary allocated section that --gc-sections collected, and it held
+only in links that collect: an interceptor for a function nothing in the
+link defines carries a word naming a function that does not exist, and in
+a --no-gc-sections link lld reported it as an undefined symbol -- eleven on
+musl (__libc_memalign, mcheck, __cxa_throw in a C link, ...), and every
+autoconf "does the compiler work" probe links that way, so every configure
+failed (openssh).  A non-alloc section was measured as well and also
+links, since lld reports undefined symbols only from relocations in live
+SHF_ALLOC sections, but it stays in the output; SHF_EXCLUDE leaves nothing.
+An interceptor for a function nothing defines cannot be live in a working
+link: the wrap list keeps such functions unwrapped, its body is collected,
+and a program's weak reference to that name stays null exactly as it does
+without the sanitizer.  The toolchain's conformance checks hold both
+halves: real-extracted.py links a probe referencing every wrapped name
+weakly, with and without --gc-sections, and requires none left as a weak
+undefined symbol; nogc-link.py links a plain program with --no-gc-sections
+and requires that to succeed.
+---
+ compiler-rt/lib/interception/interception.h   | 72 ++++++++++++++++++-
+ .../sanitizer_common/scripts/gen_wrap_list.py | 12 ++--
+ 2 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/compiler-rt/lib/interception/interception.h b/compiler-rt/lib/interception/interception.h
+index 0819a5aa5..bc83200b7 100644
+--- a/compiler-rt/lib/interception/interception.h
++++ b/compiler-rt/lib/interception/interception.h
+@@ -339,14 +339,80 @@ const interpose_substitution substitution_##func_name[]             \
+ // so REAL(func) can be initialized at link time and INTERCEPT_FUNCTION has
+ // nothing left to do.  REAL(func) stays a mutable pointer: ASSIGN_REAL() writes
+ // to it, and the aarch64 vfork interceptor calls through the variable itself.
+-// The reference is weak so that a libc missing func leaves a null pointer
+-// rather than failing the link; the call sites that can hit that already check.
++//
++// Two things about how the linker fills that pointer in, learned from six
++// targets dead at address 0 (OpenSSL declares getentropy weak, tests it for
++// null, and under --wrap saw the wrapper as present; REAL(getentropy) was
++// null).  lld resolves __real_func by re-adding func as an undefined symbol
++// with func's CURRENT binding (addWrappedSymbols), after every input has been
++// parsed.  A program's weak reference to func has by then met libc.a's lazy
++// func and left it lazy with weak binding, so the re-added undefined is weak
++// and extracts nothing, and no binding on __real_func can change that: weak,
++// REAL(func) is null and the call jumps to 0; strong, the link fails on the
++// undefined func.  So the extraction is made to happen at parse time instead,
++// by a reference to the plain name that every interceptor's object carries:
++// an address-sized word in a section of its own, marked SHF_EXCLUDE.  The
++// linker reads the object's symbol table before it decides anything about its
++// sections, so the undefined name extracts the member from libc.a then, before
++// any wrapping; the section itself it discards on sight -- that is what the
++// flag is for -- so the word is never laid out, never relocated, never in the
++// output, and the sizes patch 0018 bought are kept whether or not the link
++// garbage-collects.
++//
++// The flag matters, and it was not the first shape.  The word first lived in
++// an ordinary allocated section, .data.rel.ro.__interception_extract_func,
++// relying on --gc-sections to collect it, and that held only as long as every
++// link collected: an interceptor for a function nothing in the link defines
++// (glibc's __libc_memalign on musl, or __cxa_throw in a C link) carries a
++// word naming a function that does not exist, and in a --no-gc-sections link
++// the section is live and lld reports the undefined symbol -- eleven of them
++// on musl, and every autoconf-style "does the compiler work" probe links
++// that way on purpose, so every configure failed.  With SHF_EXCLUDE there is
++// no section for the error to be in.  That is the difference from a non-alloc
++// section, which was also measured: lld reports undefined symbols from
++// relocations in live SHF_ALLOC sections only, so a non-alloc word would
++// also have linked, but it stays in the output file, one section per
++// interceptor, and its name in the symbol table.
++//
++// __real_func stays weak.  A strong reference was tried: it turns an
++// unextracted body into a link error naming the function, which is the
++// better failure, but it also fails the one link the test suite makes ON
++// PURPOSE without the wrap list -- the control that proves the wrap list is
++// what attaches the interceptors links with __asan_wrap_list_present supplied
++// and nothing else, and with strong __real_ every live interceptor's
++// reference is an undefined symbol there.  -u func beside every --wrap would
++// extract as well, and was measured: -u is a garbage-collection root in lld,
++// so it puts the wrapped libc body in every binary whether or not anything
++// calls it.  Extraction is guaranteed by the word above instead, and two
++// conformance checks in the toolchain repository hold it: real-extracted.py
++// links a probe that references every wrapped name weakly and requires no
++// wrapped name left as a weak undefined symbol, with and without
++// --gc-sections, and nogc-link.py links a plain program with
++// --no-gc-sections and requires that to succeed.  An interceptor for a
++// function nothing defines cannot be live in a working link: the wrap list
++// keeps such functions unwrapped (gen_wrap_list.py --available), its body is
++// collected as unreferenced, and a program's weak reference to that name
++// stays null exactly as it does without the sanitizer.
++#  if defined(__arm__) || defined(__aarch64__)
++#    define __ASM_EXTRACT_PROGBITS "%progbits"
++#  else
++#    define __ASM_EXTRACT_PROGBITS "@progbits"
++#  endif
++#  if SANITIZER_WORDSIZE == 64
++#    define __ASM_EXTRACT_WORD ".8byte "
++#  else
++#    define __ASM_EXTRACT_WORD ".4byte "
++#  endif
+ #  define DEFINE_REAL(ret_type, func, ...)                            \
+     extern "C" __attribute__((weak)) ret_type __real_##func(__VA_ARGS__); \
+     typedef ret_type (*FUNC_TYPE(func))(__VA_ARGS__);                 \
+     namespace __interception {                                        \
+     FUNC_TYPE(func) PTR_TO_REAL(func) = &__real_##func;               \
+-    }
++    }                                                                 \
++    __asm__(".pushsection .interception_extract." #func               \
++            ",\"e\"," __ASM_EXTRACT_PROGBITS "\n"                     \
++            ".p2align 3\n" __ASM_EXTRACT_WORD #func "\n"               \
++            ".popsection\n");
+ #elif !SANITIZER_APPLE && !SANITIZER_FUCHSIA
+ #  define DEFINE_REAL(ret_type, func, ...)            \
+     typedef ret_type (*FUNC_TYPE(func))(__VA_ARGS__); \
+diff --git a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+index 9fd0ebf47..8989c0bbe 100755
+--- a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
++++ b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+@@ -16,11 +16,13 @@
+ # interceptors that actually exist.
+ #
+ # --wrap=<func> on a function no library in the link defines is worse than not
+-# wrapping it: the call binds to the interceptor, whose __real_<func> is a weak
+-# undefined symbol, and jumps through a null pointer -- where without the flag it
+-# would have been an undefined symbol error at link time.  So the libraries the
+-# link will provide can be named with --available, and only the interceptors that
+-# have something behind them are listed.
++# wrapping it: a program that references <func> only weakly, and tests it for
++# null before calling -- OpenSSL does this with getentropy -- sees the wrapper
++# as present, calls it, and the interceptor jumps through a null __real_<func>,
++# where without the flag the program's reference would have stayed null and
++# been skipped as it is unsanitized.  So the libraries the link will provide
++# can be named with --available, and only the interceptors that have something
++# behind them are listed.
+ #
+ # The output format is a linker response file: one --wrap=<func> per line,
+ # usable as -Wl,@<file>.  Its first line defines __asan_wrap_list_present, which

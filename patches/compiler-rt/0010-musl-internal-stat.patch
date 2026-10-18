@@ -1,0 +1,134 @@
+From 21869c2e28dbc5d95942350edbbd7ccb098ab646 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 19 Aug 2026 01:45:13 +0000
+Subject: [PATCH] [sanitizer_common] internal_stat on a libc with no struct
+ stat64
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: sanitizer_common does its own stat with a raw syscall, so that it does not
+re-enter a libc it has intercepted.  On a 32-bit Linux target it has to use
+fstatat64 and fstat64, whose buffer it declares as `struct stat64` and then
+converts to `struct stat`.  musl has no struct stat64 -- it has `#define
+stat64 stat`, and only under _LARGEFILE64_SOURCE -- so on 32-bit musl this
+file does not compile at all:
+
+  sanitizer_linux.cpp:450:17: error: variable has incomplete type 'struct stat64'
+  sanitizer_linux.cpp:335:19: error: member access into incomplete type 'struct stat64'
+
+sixteen times over, which is as far as a compiler-rt build for armv7-musl gets.
+
+The buffer musl wants is its own struct stat.  Its bits/stat.h says so: "copied
+from kernel definition, but with padding replaced by the corresponding
+correctly-sized userspace types".  The kernel's stat64 is a prefix of it, and
+the three 64-bit timestamps musl reports are members appended after the end of
+that prefix, with the 32-bit ones the kernel actually writes kept beside them
+as __st_atim32, __st_mtim32 and __st_ctim32.  musl's own fstatat does the
+syscall into a struct stat and then lifts the timestamps out of those three,
+and that is the whole of what this needs to do differently: every other member
+the kernel writes is already the member it belongs to, since musl laid the
+struct out that way on purpose.
+
+So there are two conversions now, picked by libc rather than by architecture,
+and the buffer is named through a typedef so that the three call sites do not
+have to know which one they got.  The two call sites in the branches for a
+platform that is neither Linux nor FreeBSD are left spelling `struct stat64`:
+stat64_to_stat is not defined for those either, so they were already dead on
+any target this compiles for, and changing them would suggest otherwise.
+
+The musl conversion also carries the nanoseconds across.  The glibc one does
+not -- `out->st_atime = in->st_atime` names the seconds only -- but here the
+seconds and the nanoseconds are one member each side, so writing the member is
+writing both, and leaving tv_nsec at the zero the memset put there would be a
+choice rather than the shape of the code.
+
+This is the last thing between compiler-rt 20.1.8 and a 32-bit musl target; it
+is not specific to Arm, and an i386 or m68k musl build hits it in exactly the
+same place.
+---
+ .../lib/sanitizer_common/sanitizer_linux.cpp  | 43 +++++++++++++++++--
+ 1 file changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+index a4d526b44..a6226e604 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+@@ -330,7 +330,41 @@ uptr internal_ftruncate(fd_t fd, uptr size) {
+ }
+ 
+ #    if !SANITIZER_LINUX_USES_64BIT_SYSCALLS && SANITIZER_LINUX
+-static void stat64_to_stat(struct stat64 *in, struct stat *out) {
++#      if SANITIZER_MUSL
++// musl has no struct stat64.  It has a struct stat that already is the buffer
++// the fstatat64 and fstat64 syscalls fill: its comment says "copied from kernel
++// definition, but with padding replaced by the corresponding correctly-sized
++// userspace types", and the 64-bit timestamps this libc reports are three more
++// members appended after the end of what the kernel writes.  So the buffer
++// below is a struct stat, and everything the kernel wrote is already in the
++// member it belongs to -- except the timestamps, which the kernel leaves in the
++// 32-bit __st_atim32, __st_mtim32 and __st_ctim32 it wrote and musl's own
++// fstatat lifts out of there into st_atim, st_mtim and st_ctim.  This does the
++// same lift.  (The nanoseconds come with them; the version below drops them,
++// because st_atime names only the seconds.)
++typedef struct stat struct_stat64;
++static void stat64_to_stat(struct_stat64 *in, struct stat *out) {
++  internal_memset(out, 0, sizeof(*out));
++  out->st_dev = in->st_dev;
++  out->st_ino = in->st_ino;
++  out->st_mode = in->st_mode;
++  out->st_nlink = in->st_nlink;
++  out->st_uid = in->st_uid;
++  out->st_gid = in->st_gid;
++  out->st_rdev = in->st_rdev;
++  out->st_size = in->st_size;
++  out->st_blksize = in->st_blksize;
++  out->st_blocks = in->st_blocks;
++  out->st_atim.tv_sec = in->__st_atim32.tv_sec;
++  out->st_atim.tv_nsec = in->__st_atim32.tv_nsec;
++  out->st_mtim.tv_sec = in->__st_mtim32.tv_sec;
++  out->st_mtim.tv_nsec = in->__st_mtim32.tv_nsec;
++  out->st_ctim.tv_sec = in->__st_ctim32.tv_sec;
++  out->st_ctim.tv_nsec = in->__st_ctim32.tv_nsec;
++}
++#      else
++typedef struct stat64 struct_stat64;
++static void stat64_to_stat(struct_stat64 *in, struct stat *out) {
+   internal_memset(out, 0, sizeof(*out));
+   out->st_dev = in->st_dev;
+   out->st_ino = in->st_ino;
+@@ -346,6 +380,7 @@ static void stat64_to_stat(struct stat64 *in, struct stat *out) {
+   out->st_mtime = in->st_mtime;
+   out->st_ctime = in->st_ctime;
+ }
++#      endif
+ #    endif
+ 
+ #    if SANITIZER_LINUX && defined(__loongarch__)
+@@ -447,7 +482,7 @@ uptr internal_stat(const char *path, void *buf) {
+   kernel_stat_to_stat(&buf64, (struct stat *)buf);
+   return res;
+ #      else
+-  struct stat64 buf64;
++  struct_stat64 buf64;
+   int res = internal_syscall(SYSCALL(fstatat64), AT_FDCWD, (uptr)path,
+                              (uptr)&buf64, 0);
+   stat64_to_stat(&buf64, (struct stat *)buf);
+@@ -486,7 +521,7 @@ uptr internal_lstat(const char *path, void *buf) {
+   kernel_stat_to_stat(&buf64, (struct stat *)buf);
+   return res;
+ #      else
+-  struct stat64 buf64;
++  struct_stat64 buf64;
+   int res = internal_syscall(SYSCALL(fstatat64), AT_FDCWD, (uptr)path,
+                              (uptr)&buf64, AT_SYMLINK_NOFOLLOW);
+   stat64_to_stat(&buf64, (struct stat *)buf);
+@@ -524,7 +559,7 @@ uptr internal_fstat(fd_t fd, void *buf) {
+   return internal_syscall(SYSCALL(fstat), fd, (uptr)buf);
+ #      endif
+ #    else
+-  struct stat64 buf64;
++  struct_stat64 buf64;
+   int res = internal_syscall(SYSCALL(fstat64), fd, &buf64);
+   stat64_to_stat(&buf64, (struct stat *)buf);
+   return res;

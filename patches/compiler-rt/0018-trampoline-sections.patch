@@ -1,0 +1,125 @@
+From 95058302f9ca73f115d70565de3f4b73c90eb290 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Thu, 3 Sep 2026 23:29:05 +0000
+Subject: [PATCH] [compiler-rt] static interception: one section per trampoline
+
+Every interceptor in a statically intercepting runtime is two symbols: the
+body, ___interceptor_<func>, which the compiler puts in its own section under
+-ffunction-sections, and the trampoline, __wrap_<func>, eight bytes of
+assembly that jump to the body and carry the name the linker binds calls to.
+The macro that emits the trampoline opens with a bare ".text", so every
+trampoline in a translation unit lands in that unit's one plain .text
+section: 374 of them, 2992 bytes, in asan_interceptors.cpp.o.
+
+--gc-sections works on sections.  __wrap_malloc is referenced by every
+program, so plain .text is live; every trampoline in it is then live, and
+each carries a relocation to its body, so all 391 bodies are live, and each
+body reaches its libc member through __real_<func>.  One call to malloc keeps
+iconv, regcomp and getaddrinfo in the binary.  In a hello world that is 435KB
+of interceptors and 381KB of libc that nothing calls.
+
+Under SANITIZER_STATIC_INTERCEPTION the trampoline now goes into
+.text.__wrap_<func>, a section of its own named the way the body's is.  A
+trampoline is then live exactly when the link resolved a call to its __wrap_
+name, which is when --wrap=<func> matched a reference, and the rest are
+collected along with their bodies and the libc members only they reached.
+The wrap list is unchanged and its semantics are unchanged: every function a
+program or the libc references is intercepted exactly as before; what goes is
+what nothing references.  Measured on riscv64, with the
+dynamic list also gone (a toolchain change beside this one), a stripped hello
+world goes from 1500KB to 552KB with the same wrap list, and keeps the ten
+interceptors the runtime itself calls through REAL().
+
+The flags and type are written out because ARM's assembler reads '@' as a
+comment character, so the progbits keyword is spelled per architecture the
+way ASM_TYPE_FUNCTION_STR already is.  The dynamic runtime keeps the bare
+.text: its interceptors are exported through the dynamic symbol table and
+nothing collects them, so there is nothing for a section split to change.
+
+One thing --gc-sections took with it, put back.  Patch 0002 makes a link that
+leaves the wrap list out fail on the undefined __asan_wrap_list_present, and
+carried the reference in a static pointer marked used.  "used" keeps the
+compiler from dropping the object; the linker's garbage collection dropped
+the section anyway, before undefined symbols are looked for, and the suite's
+no-wrap-list control linked a detached binary.  The reference is now made
+from AsanInitInternal(), through an asm that takes the address and does
+nothing with it, which no linker can discard from a binary that runs.
+---
+ compiler-rt/lib/asan/asan_rtl.cpp           | 14 +++++++++++++-
+ compiler-rt/lib/interception/interception.h | 20 +++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/asan/asan_rtl.cpp b/compiler-rt/lib/asan/asan_rtl.cpp
+index 9e06a1ad3..5b42aff8c 100644
+--- a/compiler-rt/lib/asan/asan_rtl.cpp
++++ b/compiler-rt/lib/asan/asan_rtl.cpp
+@@ -43,8 +43,14 @@
+ // it, and is instrumented, with every interceptor detached and no diagnostic
+ // anywhere.  The response file defines this symbol, so that leaving it out is an
+ // undefined symbol at link time instead.
++//
++// The reference is made from AsanInitInternal() below rather than held in a
++// static object: a static holding the address is a data section nothing
++// refers to, and a link with --gc-sections discards it before it looks for
++// the symbol, so the link succeeded and the control that this exists for
++// passed a detached binary.  A use in the one function every ASan binary
++// runs cannot be discarded.
+ extern "C" char __asan_wrap_list_present;
+-static char *const kAsanWrapListPresent USED = &__asan_wrap_list_present;
+ #endif
+ 
+ uptr __asan_shadow_memory_dynamic_address;  // Global interface symbol.
+@@ -453,6 +459,12 @@ static bool AsanInitInternal() {
+     return true;
+   SanitizerToolName = "AddressSanitizer";
+ 
++#if SANITIZER_STATIC_INTERCEPTION
++  // The wrap list's presence, as an undefined symbol in live code; see the
++  // declaration above.  The asm takes the address and does nothing with it.
++  __asm__ __volatile__("" : : "r"(&__asan_wrap_list_present));
++#endif
++
+   // Sealed init describes the main thread's stack rather than reading
+   // /proc/self/maps for it, and this is the frame it describes it from.  Taken
+   // here, before anything else, because everything that will be compared
+diff --git a/compiler-rt/lib/interception/interception.h b/compiler-rt/lib/interception/interception.h
+index 497823513..0819a5aa5 100644
+--- a/compiler-rt/lib/interception/interception.h
++++ b/compiler-rt/lib/interception/interception.h
+@@ -218,9 +218,27 @@ const interpose_substitution substitution_##func_name[]             \
+ #  endif  // SANITIZER_STATIC_INTERCEPTION
+ #  if defined(__arm__) || defined(__aarch64__)
+ #   define ASM_TYPE_FUNCTION_STR "%function"
++#   define ASM_TYPE_PROGBITS_STR "%progbits"
+ #  else
+ #   define ASM_TYPE_FUNCTION_STR "@function"
++#   define ASM_TYPE_PROGBITS_STR "@progbits"
+ #  endif
++#  if SANITIZER_STATIC_INTERCEPTION
++// One section per trampoline, named the way -ffunction-sections names the
++// body's.  A bare .text puts every trampoline in the translation unit into the
++// one section of that name, and each trampoline refers to its body, so with
++// --gc-sections a single live one -- __wrap_malloc, in every program -- keeps
++// all of them and, through them, every interceptor body and every libc member
++// those reach through __real_.  Placed apart, a trampoline is live exactly when
++// the link resolved a call to its __wrap_ name, which is when --wrap=<func>
++// matched a reference, and the rest go.  The dynamic runtime keeps .text: its
++// interceptors are exported, and nothing collects them.
++#   define __ASM_WRAPPER_SECTION(func)                                        \
++      ".section .text." __ASM_WRAPPER_SYM(func) ",\"ax\","                    \
++        ASM_TYPE_PROGBITS_STR "\n"
++#  else
++#   define __ASM_WRAPPER_SECTION(func) ".text\n"
++#  endif  // SANITIZER_STATIC_INTERCEPTION
+ // Keep trampoline implementation in sync with sanitizer_common/sanitizer_asm.h
+ #  define DECLARE_WRAPPER(ret_type, func, ...)                                 \
+      extern "C" ret_type func(__VA_ARGS__);                                    \
+@@ -228,7 +246,7 @@ const interpose_substitution substitution_##func_name[]             \
+      extern "C" ret_type __interceptor_##func(__VA_ARGS__)                     \
+        INTERCEPTOR_ATTRIBUTE __attribute__((weak)) ALIAS(WRAP(func));          \
+      asm(                                                                      \
+-       ".text\n"                                                               \
++       __ASM_WRAPPER_SECTION(func)                                             \
+        __ASM_WRAPPER_BINDING(func)                                             \
+        ".set " __ASM_WRAPPER_SYM(func) ", "                                    \
+          SANITIZER_STRINGIFY(TRAMPOLINE(func)) "\n"                            \

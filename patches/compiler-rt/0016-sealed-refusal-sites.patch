@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Sun, 30 Aug 2026 18:26:21 +0000
+Subject: [PATCH] [compiler-rt] sealed init: the four refusal sites the spin
+ rule did not reach
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Patch 0015 put SealedHangOnAllocationFailure() first in each of the
+seven places the runtime gives up on memory, and said so in its
+message: "every MmapOrDie variant funnels through ReportMmapFailureAndDie",
+plus the ENOMEM-tolerating shadow paths and the internal allocator.  A
+downstream sweep -- over the pinned compiler-rt and
+this series, each candidate handed to an independent refuter and dropped
+unless confirmed, 44 examined, 16 kept -- found that count covers 12 of
+the 16, and that the way the four were missed is itself the method for not
+missing them.  Sort every mmap wrapper by reading its body:
+
+  (A) dies unconditionally: MmapOrDie, MmapFixedOrDie, MmapNoReserveOrDie,
+      and the OnFatalError variants on anything but ENOMEM.  All funnel
+      through ReportMmapFailureAndDie.  Covered by 0015.
+  (B) tolerates ENOMEM and returns null or false: MmapFixedNoReserve,
+      MmapFixedSuperNoReserve, MmapOrDieOnFatalError,
+      MmapFixedOrDieOnFatalError, MmapAlignedOrDieOnFatalError.  The
+      answer lives at each CALL SITE, and 0015 only had the shadow's.
+  (C) checks nothing and returns internal_mmap's raw -errno: MmapNoAccess
+      and MmapFixedNoAccess.  Covered only where the caller tests the
+      value before using it; ProtectGap does, and one caller did not.
+
+The four, in the order they matter:
+
+1. ReservedAddressRange::Init (sanitizer_posix_libcdep.cpp), class (C).
+   Not a death.  It handed MmapNoAccess's -errno back as the base, and
+   InitAligned's fixup, start += align - (start & (align - 1)), takes
+   every -errno in -1..-4095 to exactly 0 (the sweep ran all 4095), so a
+   refused primary-allocator reservation came up as an arena based at
+   address 0, passed CHECK_NE(NonConstSpaceBeg, ~0), and ran until the
+   first allocation poisoned shadow for an address inside the gap.  The
+   secondary's chunk array uses the same Init and its CHECK(p) passes on
+   -ENOMEM directly.  The test is in Init, before the value is used, so it
+   covers both callers and InitAligned's fixup never sees an error.
+   Unsealed behaviour is unchanged.
+2. QuarantineCallback::Allocate (asan_allocator.cpp), class (B), on the
+   first free().  It calls ReportOutOfMemory unconditionally -- it does
+   not consult AllocatorMayReturnNull(), unlike the user-facing Allocate
+   -- so allocator_may_return_null does not save it, and the ENOMEM
+   behind its null was tolerated in MmapFixedImpl where no die-helper saw
+   it.  This is the runtime's own allocation, made inside a call the
+   plain build makes without allocating, so the rule applies: spin.
+3. PoisonShadow (asan_poisoning.cpp): the CHECK where site 1 used to die.
+   Init now stops it at the source; this holds the CHECK to the same rule
+   at the place the corruption surfaced, so that no other route to an
+   address outside the application ranges becomes a report instead.
+4. SizeClassAllocator64::ReturnToAllocator (primary64.h), class (B):
+   EnsureFreeArraySpace maps through MmapFixedOrDieOnFatalError and its
+   ENOMEM is answered at this call site with Report and Die.  Needs 65536
+   frees in one size class, so not a start-up site; converted under
+   0015's rule that the seal holds for the life of the process.
+
+The non-mmap candidates -- /proc reads, getrlimit, madvise, /dev/urandom, the
+stack depot, gettid -- came back empty as shipped: the seal already
+removed those calls.  Same exception as 0015: a failure while a report is
+in progress aborts.
+
+The suite gains sealed_arena_refused, whose wrapper answers EPERM to the
+one PROT_NONE mmap of 4GiB or more at no fixed address that a sealed
+start-up makes; before this patch the sealed build dies through site 3
+(measured on x86_64 with strace injecting EPERM on mmap #6: region info
+mapped at 0x40000000000 = 0 + the arena size, then the CHECK, gettid, two
+writes, exit_group(1)), and after it the trace ends at the refused mmap and
+the build is still running at the timeout with nothing written, the
+verdict sealed_alloc_refused is held to.
+---
+ compiler-rt/lib/asan/asan_allocator.cpp               | 10 +++++++++-
+ compiler-rt/lib/asan/asan_poisoning.cpp               |  8 ++++++++
+ .../lib/sanitizer_common/sanitizer_allocator.h        |  1 +
+ .../sanitizer_common/sanitizer_allocator_primary64.h  |  5 +++++
+ .../lib/sanitizer_common/sanitizer_posix_libcdep.cpp  | 11 +++++++++++
+ 5 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/compiler-rt/lib/asan/asan_allocator.cpp b/compiler-rt/lib/asan/asan_allocator.cpp
+index 3a55c2af6..6b92cdc3b 100644
+--- a/compiler-rt/lib/asan/asan_allocator.cpp
++++ b/compiler-rt/lib/asan/asan_allocator.cpp
+@@ -32,6 +32,7 @@
+ #include "sanitizer_common/sanitizer_internal_defs.h"
+ #include "sanitizer_common/sanitizer_list.h"
+ #include "sanitizer_common/sanitizer_quarantine.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_stackdepot.h"
+ 
+ namespace __asan {
+@@ -265,8 +266,15 @@ struct QuarantineCallback {
+   void *Allocate(uptr size) const {
+     void *res = get_allocator().Allocate(cache_, size, 1);
+     // TODO(alekseys): Consider making quarantine OOM-friendly.
+-    if (UNLIKELY(!res))
++    // This is the runtime's own allocation, made inside free(), and it
++    // reports unconditionally -- allocator_may_return_null is not consulted,
++    // unlike the user-facing path in Allocate().  The ENOMEM behind a null
++    // here was tolerated by MmapFixedImpl, so no die-helper saw it: a sealed
++    // binary stops at this call site.  See SealedHangOnAllocationFailure.
++    if (UNLIKELY(!res)) {
++      SealedHangOnAllocationFailure();
+       ReportOutOfMemory(size, stack_);
++    }
+     return res;
+   }
+ 
+diff --git a/compiler-rt/lib/asan/asan_poisoning.cpp b/compiler-rt/lib/asan/asan_poisoning.cpp
+index 762670632..ca5894ef8 100644
+--- a/compiler-rt/lib/asan/asan_poisoning.cpp
++++ b/compiler-rt/lib/asan/asan_poisoning.cpp
+@@ -20,6 +20,7 @@
+ #include "sanitizer_common/sanitizer_flags.h"
+ #include "sanitizer_common/sanitizer_interface_internal.h"
+ #include "sanitizer_common/sanitizer_libc.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ 
+ namespace __asan {
+ 
+@@ -36,6 +37,13 @@ bool CanPoisonMemory() {
+ void PoisonShadow(uptr addr, uptr size, u8 value) {
+   if (value && !CanPoisonMemory()) return;
+   CHECK(AddrIsAlignedByGranularity(addr));
++  // An address outside the application ranges is what a laundered
++  // allocation failure looks like from here (an arena based at 0 poisons
++  // into the shadow gap).  ReservedAddressRange::Init now stops that at its
++  // source; this is the same rule at the place the CHECK would have fired,
++  // so that no other route to it becomes a report.
++  if (UNLIKELY(!AddrIsInMem(addr)))
++    SealedHangOnAllocationFailure();
+   CHECK(AddrIsInMem(addr));
+   CHECK(AddrIsAlignedByGranularity(addr + size));
+   CHECK(AddrIsInMem(addr + size - ASAN_SHADOW_GRANULARITY));
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_allocator.h b/compiler-rt/lib/sanitizer_common/sanitizer_allocator.h
+index 0b28f86d1..fd9f86873 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_allocator.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_allocator.h
+@@ -22,6 +22,7 @@
+ #include "sanitizer_local_address_space_view.h"
+ #include "sanitizer_mutex.h"
+ #include "sanitizer_procmaps.h"
++#include "sanitizer_sealed.h"
+ #include "sanitizer_type_traits.h"
+ 
+ namespace __sanitizer {
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_allocator_primary64.h b/compiler-rt/lib/sanitizer_common/sanitizer_allocator_primary64.h
+index 51ac1b6ae..bca255449 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_allocator_primary64.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_allocator_primary64.h
+@@ -185,6 +185,11 @@ class SizeClassAllocator64 {
+     // recoverable.
+     if (UNLIKELY(!EnsureFreeArraySpace(region, region_beg,
+                                        new_num_freed_chunks))) {
++      // EnsureFreeArraySpace maps through MmapFixedOrDieOnFatalError, which
++      // tolerates ENOMEM and answers it here, so this is the call site the
++      // sealed rule applies to; any other mmap error already stopped inside
++      // the die-helper.  See SealedHangOnAllocationFailure.
++      SealedHangOnAllocationFailure();
+       Report(
+           "FATAL: Internal error: %s's allocator exhausted the free list "
+           "space for size class %zu (%zu bytes).\n",
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+index 43fe0c871..975d7c0ee 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+@@ -422,6 +422,17 @@ bool MmapFixedSuperNoReserve(uptr fixed_addr, uptr size, const char *name) {
+ uptr ReservedAddressRange::Init(uptr size, const char *name, uptr fixed_addr) {
+   base_ = fixed_addr ? MmapFixedNoAccess(fixed_addr, size, name)
+                      : MmapNoAccess(size);
++  // MmapNoAccess and MmapFixedNoAccess are the two mmap wrappers that check
++  // nothing: they hand back internal_mmap's raw -errno, and this is the only
++  // caller that then treats the value as an address.  InitAligned's fixup,
++  // start += align - (start & (align - 1)), takes every -errno in -1..-4095
++  // to exactly 0, so a refused primary-allocator reservation would become an
++  // arena based at address 0 and pass the CHECK_NE(..., ~0) downstream; the
++  // secondary's chunk array passes its CHECK(p) on the raw -ENOMEM directly.
++  // A sealed binary stops here instead, before the value is used.  Unsealed
++  // behaviour is unchanged.  See SealedHangOnAllocationFailure.
++  if (UNLIKELY(internal_iserror(reinterpret_cast<uptr>(base_))))
++    SealedHangOnAllocationFailure();
+   size_ = size;
+   name_ = name;
+   (void)os_handle_;  // unsupported

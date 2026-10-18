@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Fri, 28 Aug 2026 00:55:16 +0000
+Subject: [PATCH] [compiler-rt] sealed init: a runtime that cannot get memory spins, without
+ a syscall
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Sealed init (patch 0012) made the runtime's start-up a function of the
+binary alone, and measured it on runs that start.  A run whose start-up
+fails was left on the unsealed path, and a syscall sweep found it there:
+refuse the runtime's first mmap and a sealed binary makes a getpid, reads
+/proc/self/maps twice, makes three more getpids, and exits 0.
+
+The path is ReportMmapFailureAndDie: Report() prefixes the pid, which is a
+getpid; DumpProcessMap() constructs a MemoryMappingLayout with the cache
+enabled, which reads /proc/self/maps once for the cache and once for
+itself; then UNREACHABLE, so CheckFailed() and Die().  Die() exits with
+common_flags()->exitcode -- and the runtime's first allocation is the flag
+parser's page, taken in FlagParser::FlagParser from InitializeFlags BEFORE
+SetCommonFlagsDefaults() has run, so when that is the allocation that
+fails, the exit status is the zero-initialized 0.  A start-up that could
+not happen, reported as success.  Silent reports (patch 0014) drops the
+writes from that sequence and nothing else.
+
+What this patch does: in a sealed binary, an allocation the runtime cannot
+get for itself is a spin, forever, on the frame that found out, making no
+syscall.  No Report, no process map, no CHECK, no die callbacks, no write
+-- and no exit.
+
+Why a spin and not an exit.  The caller this mode exists for compares the
+syscall trace of a sealed binary against that of the same program built
+plain, over prefix-closed trace sets: a run that stops emitting events is a
+prefix of some run and is allowed.  Up to the refused allocation the two
+binaries have made the same program syscalls, so a process that stops
+there emits nothing the plain trace lacks.  An exit adds an exit_group the
+plain binary does not make there, and the run diverges in a way every
+theorem would have to name.  _exit(1) was built and measured first -- it
+makes exactly one syscall -- and this makes none.
+
+For the life of the process, not only start-up: the same functions fail
+the same way after main -- every malloc goes through the sanitizer's
+allocator, a pthread_create mmaps a descriptor and a fake stack, the stack
+depot grows -- and a refusal there is the same falsifier, later.
+
+With one exception, keyed on purpose rather than phase: an allocation that
+fails while an ERROR REPORT IS IN PROGRESS is an abort.  The report
+machinery allocates, and a refusal inside it turned into a spin would make
+a detection vanish -- the run would look like a hang, an equivalence would
+hold on the buggy input, and the theorem would certify nothing about the
+bugs the sanitizer exists to find.  A detection that dies is a detection,
+and it dies by SIGABRT rather than exit_group(exitcode) so that what killed
+it is not a status the program could have returned itself; the
+rt_sigprocmask and tkill Abort() makes are outside the modeled set,
+accepted, because a run that found a bug has already left the seal.  sealed_report_in_progress
+is set on entry to ASan's ScopedInErrorReport, UBSan's ScopedReport and
+Die(), and never cleared.
+
+Left where they were: the program's own allocations (a malloc the
+allocator cannot satisfy is a report or, with allocator_may_return_null, a
+null -- symmetric with the plain build, whose malloc fails the same way),
+detections and their exit status, and CHECK failures that are not
+allocation failures.
+
+One inline function, SealedHangOnAllocationFailure() in sanitizer_sealed.h,
+a no-op unless the link defines __sanitizer_sealed_init, called first thing
+in each of the seven places the runtime gives up on an allocation:
+ReportMmapFailureAndDie and ReportMunmapFailureAndDie (every MmapOrDie
+variant funnels through the first); the ENOMEM-tolerating
+MmapFixedNoReserve, which Reports before returning null;
+ReserveShadowMemoryRange and ProtectGap, which Report and Die on their own;
+ReportInternalAllocatorOutOfMemory; and the shadow-interleave abort in
+asan_shadow_setup.cpp, unreachable when sealed and held to the rule anyway.
+
+Measured, x86_64, behind the test suite's seccomp allow-list
+(SECCOMP_RET_KILL_PROCESS default): with the first mmap refused, the sealed
+binary used to be killed at its first getpid and now makes no syscall past
+the refused mmap and does not exit; with a mid-run 8MiB malloc's mmap
+refused, it prints its start line and then the same.  And the exception:
+on a heap-buffer-overflow, with the first mmap after the report's banner
+refused (strace -e inject=mmap:error=EPERM:when=23, the 22 before it being
+start-up's and the program's), the process writes the banner and dies by
+SIGABRT -- rt_sigprocmask, tkill, nothing else after the refusal, and no
+spin.
+Nothing changes in an unsealed binary.
+---
+ compiler-rt/lib/asan/asan_report.cpp          |   4 +
+ compiler-rt/lib/asan/asan_shadow_setup.cpp    |   5 +
+ .../sanitizer_common/sanitizer_allocator.cpp  |   2 +
+ .../lib/sanitizer_common/sanitizer_common.cpp |   8 ++
+ .../sanitizer_common_libcdep.cpp              |   6 +
+ .../sanitizer_posix_libcdep.cpp               |   4 +
+ .../lib/sanitizer_common/sanitizer_sealed.h   | 108 ++++++++++++++++++
+ .../sanitizer_termination.cpp                 |   4 +
+ compiler-rt/lib/ubsan/ubsan_diag.cpp          |   6 +-
+ 9 files changed, 146 insertions(+), 1 deletion(-)
+
+diff --git a/compiler-rt/lib/asan/asan_report.cpp b/compiler-rt/lib/asan/asan_report.cpp
+index 45aa607dc..fab085cf0 100644
+--- a/compiler-rt/lib/asan/asan_report.cpp
++++ b/compiler-rt/lib/asan/asan_report.cpp
+@@ -26,6 +26,7 @@
+ #include "sanitizer_common/sanitizer_interface_internal.h"
+ #include "sanitizer_common/sanitizer_placement_new.h"
+ #include "sanitizer_common/sanitizer_report_decorator.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_stackdepot.h"
+ #include "sanitizer_common/sanitizer_symbolizer.h"
+ 
+@@ -126,6 +127,9 @@ class ScopedInErrorReport {
+  public:
+   explicit ScopedInErrorReport(bool fatal = false)
+       : halt_on_error_(fatal || flags()->halt_on_error) {
++    // From here on, a sealed binary's internal allocation failure is an
++    // abort rather than a spin; see SealedHangOnAllocationFailure.
++    SealedEnterReport();
+     // Make sure the registry and sanitizer report mutexes are locked while
+     // we're printing an error report.
+     // We can lock them only here to avoid self-deadlock in case of
+diff --git a/compiler-rt/lib/asan/asan_shadow_setup.cpp b/compiler-rt/lib/asan/asan_shadow_setup.cpp
+index fc6de3962..f12222413 100644
+--- a/compiler-rt/lib/asan/asan_shadow_setup.cpp
++++ b/compiler-rt/lib/asan/asan_shadow_setup.cpp
+@@ -18,6 +18,7 @@
+ 
+ #  include "asan_internal.h"
+ #  include "asan_mapping.h"
++#  include "sanitizer_common/sanitizer_sealed.h"
+ 
+ namespace __asan {
+ 
+@@ -109,6 +110,10 @@ void InitializeShadowMemory() {
+     ProtectGap(kShadowGap2Beg, kShadowGap2End - kShadowGap2Beg + 1);
+     ProtectGap(kShadowGap3Beg, kShadowGap3End - kShadowGap3Beg + 1);
+   } else {
++    // Unreachable when sealed -- MemoryRangeIsAvailable answers yes without
++    // looking -- and held to the seal's rule anyway; see
++    // SealedHangOnAllocationFailure.
++    SealedHangOnAllocationFailure();
+     Report(
+         "Shadow memory range interleaves with an existing memory mapping. "
+         "ASan cannot proceed correctly. ABORTING.\n");
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_allocator.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_allocator.cpp
+index 9d899371c..bea21187f 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_allocator.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_allocator.cpp
+@@ -18,6 +18,7 @@
+ #include "sanitizer_atomic.h"
+ #include "sanitizer_common.h"
+ #include "sanitizer_platform.h"
++#include "sanitizer_sealed.h"
+ 
+ namespace __sanitizer {
+ 
+@@ -77,6 +78,7 @@ static void RawInternalFree(void *ptr, InternalAllocatorCache *cache) {
+ }
+ 
+ static void NORETURN ReportInternalAllocatorOutOfMemory(uptr requested_size) {
++  SealedHangOnAllocationFailure();
+   SetAllocatorOutOfMemory();
+   Report("FATAL: %s: internal allocator is out of memory trying to allocate "
+          "0x%zx bytes\n", SanitizerToolName, requested_size);
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
+index c90806618..aed246e47 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
+@@ -29,6 +29,8 @@ uptr sealed_init_frame;
+ 
+ void SealedSetInitFrame(uptr frame) { sealed_init_frame = frame; }
+ 
++atomic_uint32_t sealed_report_in_progress;
++
+ atomic_uint32_t current_verbosity;
+ uptr PageSizeCached;
+ u32 NumberOfCPUsCached;
+@@ -43,6 +45,11 @@ uptr stoptheworld_tracer_ppid = 0;
+ void NORETURN ReportMmapFailureAndDie(uptr size, const char *mem_type,
+                                       const char *mmap_type, error_t err,
+                                       bool raw_report) {
++  // A sealed binary stops here, for good: before the Report(), the process
++  // map and the CHECK below, each of which is a syscall outside the seal --
++  // and before Die(), whose exit status does not exist yet when the failed
++  // allocation is the flag parser's.  See SealedHangOnAllocationFailure.
++  SealedHangOnAllocationFailure();
+   static int recursion_count;
+   if (raw_report || recursion_count) {
+     // If raw report is requested or we went into recursion just die.  The
+@@ -68,6 +75,7 @@ void NORETURN ReportMmapFailureAndDie(uptr size, const char *mem_type,
+ 
+ void NORETURN ReportMunmapFailureAndDie(void *addr, uptr size, error_t err,
+                                         bool raw_report) {
++  SealedHangOnAllocationFailure();
+   static int recursion_count;
+   if (raw_report || recursion_count) {
+     // If raw report is requested or we went into recursion just die.  The
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_common_libcdep.cpp
+index f275e81ff..100553b9a 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common_libcdep.cpp
+@@ -16,6 +16,7 @@
+ #include "sanitizer_flags.h"
+ #include "sanitizer_interface_internal.h"
+ #include "sanitizer_procmaps.h"
++#include "sanitizer_sealed.h"
+ #include "sanitizer_stackdepot.h"
+ 
+ namespace __sanitizer {
+@@ -167,6 +168,10 @@ void ReserveShadowMemoryRange(uptr beg, uptr end, const char *name,
+   DecreaseTotalMmap(size);  // Don't count the shadow against mmap_limit_mb.
+   if (madvise_shadow ? !MmapFixedSuperNoReserve(beg, size, name)
+                      : !MmapFixedNoReserve(beg, size, name)) {
++    // The one allocation failure that does not go through
++    // ReportMmapFailureAndDie: ENOMEM is tolerated by the mmap and answered
++    // here.  Same rule, see SealedHangOnAllocationFailure.
++    SealedHangOnAllocationFailure();
+     Report(
+         "ReserveShadowMemoryRange failed while trying to map 0x%zx bytes. "
+         "Perhaps you're using ulimit -v or ulimit -d\n",
+@@ -198,6 +203,7 @@ void ProtectGap(uptr addr, uptr size, uptr zero_base_shadow_start,
+     }
+   }
+ 
++  SealedHangOnAllocationFailure();
+   Report(
+       "ERROR: Failed to protect the shadow gap. "
+       "%s cannot proceed correctly. ABORTING.\n",
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+index b1eb2009c..43fe0c871 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+@@ -22,6 +22,7 @@
+ #include "sanitizer_platform_limits_solaris.h"
+ #include "sanitizer_posix.h"
+ #include "sanitizer_procmaps.h"
++#include "sanitizer_sealed.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -387,6 +388,9 @@ static bool MmapFixed(uptr fixed_addr, uptr size, int additional_flags,
+                 MAP_PRIVATE | MAP_FIXED | additional_flags | MAP_ANON, name);
+   int reserrno;
+   if (internal_iserror(p, &reserrno)) {
++    // Tolerated ENOMEM still Reports before returning null, and a sealed
++    // binary stops before that; see SealedHangOnAllocationFailure.
++    SealedHangOnAllocationFailure();
+     Report(
+         "ERROR: %s failed to "
+         "allocate 0x%zx (%zd) bytes at address %p (errno: %d)\n",
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+index 385a4dcf7..00c56b5e3 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+@@ -31,6 +31,11 @@
+ //     constants rather than being derived from the address of the current
+ //     frame, and the constants are the Sv48 layout's.  See
+ //     kSealedMaxUserVirtualAddress below.
++//   - an allocation the runtime cannot get for itself -- an mmap the kernel
++//     refuses, a shadow it cannot reserve, an internal allocator with nothing
++//     left -- is a spin, forever, making no syscall: not a diagnostic and not
++//     an exit either.  Unless an error report is in progress, in which case it
++//     is an abort.  See SealedHangOnAllocationFailure below.
+ //
+ // What remains at start-up is mmap, munmap, mprotect and the program's own
+ // syscalls.  A run that reports an error is not sealed and is not meant to be:
+@@ -56,7 +61,9 @@
+ #ifndef SANITIZER_SEALED_H
+ #define SANITIZER_SEALED_H
+ 
++#include "sanitizer_atomic.h"
+ #include "sanitizer_internal_defs.h"
++#include "sanitizer_libc.h"
+ #include "sanitizer_platform.h"
+ 
+ extern "C" {
+@@ -81,6 +88,107 @@ namespace __sanitizer {
+ // a constant to every caller and the branches below fold away in each run.
+ inline bool SealedInit() { return &__sanitizer_sealed_init != nullptr; }
+ 
++// What a sealed binary does when the runtime cannot get memory for itself:
++// nothing, forever.  It spins, on the frame that found out, making no syscall.
++//
++// The unsealed runtime answers the same failure with its report machinery.
++// ReportMmapFailureAndDie is the shape of it: Report(), which prefixes the pid
++// and so is a getpid; DumpProcessMap(), which is two reads of /proc/self/maps
++// (MemoryMappingLayout with cache_enabled reads once to fill the cache and once
++// for itself) and an MmapOrDie of its own; then UNREACHABLE, so CheckFailed()
++// and Die(), which runs the die callbacks and exits with common_flags()->
++// exitcode.  Every one of those is a syscall the seal promised not to make,
++// and one of them is wrong as well as unsealed: the runtime's first allocation
++// is the flag parser's page (FlagParser::FlagParser, from InitializeFlags),
++// which is taken BEFORE SetCommonFlagsDefaults() runs, so when that is the
++// allocation that fails, Die() reads the zero-initialized exitcode and the
++// process exits 0 -- a start-up that could not happen, reported as success.
++// Measured, x86_64, first mmap refused with EPERM: getpid, two openat of
++// /proc/self/maps, three more getpids, exit_group(0).
++//
++// Why a spin and not an exit.  The caller this mode exists for compares the
++// syscall trace of a sealed binary against the trace of the same program
++// built plain, and its trace sets are prefix-closed: a run that stops emitting
++// events partway through is a prefix of some run, and is allowed.  Up to the
++// refused allocation the two binaries have made the same program syscalls
++// (the runtime's own mmaps are excused as the runtime's), so a process that
++// stops there emits nothing the plain trace does not have.  An exit does not
++// stop there: exit_group is an event, it is one the plain binary does not
++// make at that point, and the run diverges in a way the model would have to
++// name -- a case split over every theorem, for a run in which nothing about
++// the program was learned.  A spin is the one answer whose trace contribution
++// is empty.  _exit(1) was the alternative that was built first, and it was
++// measured to make exactly one syscall; this makes none.
++//
++// It applies for the life of the process, not only during start-up.  The
++// same functions fail the same way later: every malloc the program makes goes
++// through the sanitizer's allocator, which mmaps regions and large chunks on
++// demand; a pthread_create mmaps a thread descriptor and a fake stack; the
++// stack depot and quarantine grow.  A refusal there is the same falsifier as
++// one at start-up, later -- an exit the plain binary does not make -- and the
++// prefix argument is the same, so the answer is the same.
++//
++// The one exception, and it matters more than when the failure happens: an
++// allocation that fails while an ERROR REPORT IS IN PROGRESS is an abort.
++// The report machinery allocates -- the stack depot, symbolization, the
++// internal allocator for the report's own bookkeeping -- and if the sanitizer
++// finds a real bug, starts reporting, and a refusal inside that path turned
++// into a spin, the detection would vanish: the run would look like a hang the
++// plain build also could have, an equivalence would hold on the buggy input,
++// and the theorem would certify nothing about the bugs the sanitizer exists
++// to find.  A detection that dies is a detection; a detection that spins is
++// not.  And it dies by SIGABRT rather than by exit_group(exitcode) so that
++// what killed it is not a status the program itself could have returned: a
++// caller who sees the death sees a report that could not finish, not a
++// program that chose 1.  What Abort() does to get there -- an
++// rt_sigprocmask and a tkill -- is outside the modeled set, and that is
++// accepted: this is a run that has already left the seal by finding a bug.  So the rule is keyed on purpose, not on phase.
++// sealed_report_in_progress is set on the way into every report scope --
++// ASan's ScopedInErrorReport, UBSan's ScopedReport -- and on entry to Die(),
++// which is where every other report path ends up, and it is never cleared:
++// once a process has started reporting, its next internal allocation failure
++// is an abort.
++//
++// Two boundaries deliberately left where they were.  The program's own
++// allocations: a malloc the sanitizer's allocator cannot satisfy with ENOMEM
++// is answered as it always was -- a report (ReportOutOfMemory) or, with
++// allocator_may_return_null, a null the program handles -- because that
++// failure is symmetric with the plain build's, whose malloc fails the same
++// way, and a spin there would create an asymmetry where none exists.  And
++// detections: the report path, its exit status, and everything the
++// silent-reports mode (sanitizer_silent.h) governs are untouched.  Nor does
++// any of this cover CHECK failures that are not allocation failures.
++//
++// The loop is a compiler barrier and nothing else: no sched_yield (a syscall),
++// no pause instruction needed (nothing is waiting on it), and the asm
++// statement is what keeps a compiler from treating a side-effect-free infinite
++// loop as unreachable.
++//
++// Called first thing in each place the runtime gives up on an allocation:
++// ReportMmapFailureAndDie and ReportMunmapFailureAndDie (every MmapOrDie
++// variant funnels through the first); the ENOMEM-tolerating MmapFixedNoReserve
++// in sanitizer_posix_libcdep.cpp, which Reports before it returns null;
++// ReserveShadowMemoryRange and ProtectGap, which Report and Die on their own;
++// the internal allocator's out-of-memory path; and the shadow-interleave
++// abort in asan_shadow_setup.cpp, which sealed mode cannot reach but is held
++// to the same rule so that it is not an exception waiting to become one.  It
++// is a no-op in an unsealed binary.
++extern atomic_uint32_t sealed_report_in_progress;
++void NORETURN Abort();  // sanitizer_common.h, which this header does not include
++
++inline void SealedEnterReport() {
++  if (SealedInit())
++    atomic_store(&sealed_report_in_progress, 1, memory_order_relaxed);
++}
++
++inline void SealedHangOnAllocationFailure() {
++  if (!SealedInit())
++    return;
++  if (atomic_load(&sealed_report_in_progress, memory_order_relaxed))
++    Abort();
++  for (;;) __asm__ __volatile__("" ::: "memory");
++}
++
+ #if SANITIZER_RISCV64
+ // riscv64 is the one architecture here whose shadow offset is not a constant:
+ // asan_mapping.h selects ASAN_SHADOW_OFFSET_DYNAMIC for it, the offset comes
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_termination.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_termination.cpp
+index 6a5473435..2e040b6eb 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_termination.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_termination.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "sanitizer_common.h"
+ #include "sanitizer_libc.h"
++#include "sanitizer_sealed.h"
+ 
+ namespace __sanitizer {
+ 
+@@ -48,6 +49,9 @@ void SetUserDieCallback(DieCallbackType callback) {
+ }
+ 
+ void NORETURN Die() {
++  // Every report path ends here; from here on a sealed binary's internal
++  // allocation failure is an abort.  See SealedHangOnAllocationFailure.
++  SealedEnterReport();
+   if (UserDieCallback)
+     UserDieCallback();
+   for (int i = kMaxNumOfInternalDieCallbacks - 1; i >= 0; i--) {
+diff --git a/compiler-rt/lib/ubsan/ubsan_diag.cpp b/compiler-rt/lib/ubsan/ubsan_diag.cpp
+index 2146ed3c2..ba8cdff59 100644
+--- a/compiler-rt/lib/ubsan/ubsan_diag.cpp
++++ b/compiler-rt/lib/ubsan/ubsan_diag.cpp
+@@ -18,6 +18,7 @@
+ #include "ubsan_monitor.h"
+ #include "sanitizer_common/sanitizer_placement_new.h"
+ #include "sanitizer_common/sanitizer_report_decorator.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_stacktrace.h"
+ #include "sanitizer_common/sanitizer_stacktrace_printer.h"
+ #include "sanitizer_common/sanitizer_suppressions.h"
+@@ -389,7 +390,10 @@ ScopedReport::Initializer::Initializer() { InitAsStandaloneIfNecessary(); }
+ 
+ ScopedReport::ScopedReport(ReportOptions Opts, Location SummaryLoc,
+                            ErrorType Type)
+-    : Opts(Opts), SummaryLoc(SummaryLoc), Type(Type) {}
++    : Opts(Opts), SummaryLoc(SummaryLoc), Type(Type) {
++  // See SealedHangOnAllocationFailure.
++  SealedEnterReport();
++}
+ 
+ ScopedReport::~ScopedReport() {
+   MaybePrintStackTrace(Opts.pc, Opts.bp);

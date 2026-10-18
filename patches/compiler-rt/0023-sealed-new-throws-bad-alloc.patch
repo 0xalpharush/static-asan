@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 16 Sep 2026 19:12:47 +0000
+Subject: [PATCH] [compiler-rt] sealed init: operator new throws bad_alloc when
+ the allocation is refused
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Patch 0015 drew the line between the runtime's failures and the
+program's, and 0022 held it at the one refusal that is both: a malloc the
+program cannot get is the program's -- a report or, under
+allocator_may_return_null, a NULL.  The sentence
+this series implements is: the sanitizer's own failures are unreachable; the
+program's may-fail outcomes stay visible.  The C++ half of that
+sentence was not implemented.
+
+The program's may-fail outcome for a throwing form of operator new is
+std::bad_alloc.  libc++abi's operator new (libcxxabi/src/
+stdlib_new_delete.cpp) loops on malloc and throws when it returns null
+with no new_handler installed, and a program written
+`try { p = new T[n]; } catch (const std::bad_alloc &)` continues from the
+catch.  The runtime replaces that operator new: asan_new_delete.cpp
+defines the eight forms weak, under the real mangled names, in
+libclang_rt.asan_cxx.a, which a C++ link takes whole and before libc++.a
+and a C link never sees, so its definitions are the ones in the binary.
+Upstream's bodies answer a refusal with ReportOutOfMemory whatever
+allocator_may_return_null says: the flag makes asan_memalign return the
+null, and OPERATOR_NEW_BODY then reports the null.  So plain C++
+binaries catch bad_alloc and go on where their sealed twins
+abort, on a difference the
+sanitizer made rather than one it found.
+
+The same principle applied: in a sealed binary the
+throwing forms of operator new -- plain, array, and the align_val_t forms
+-- throw std::bad_alloc when the allocation is refused, exactly as the
+program's own operator new does; the nothrow forms keep returning nullptr;
+unsealed behaviour is unchanged.
+
+One function and two macros.  SealedThrowBadAlloc() is called first where
+OPERATOR_NEW_BODY and OPERATOR_NEW_BODY_ALIGN had ReportOutOfMemory alone,
+on `!nothrow && !res`.  It returns at once when the seal is off, and when
+it is on calls libc++'s std::__throw_bad_alloc(), so the report is not
+reached.  A runtime compiled with -fno-exceptions cannot write `throw` and
+does not have to: libc++ defines std::__throw_bad_alloc in
+libcxx/src/new_helpers.cpp -- namespace std, "purposefully not versioned",
+so the symbol is _ZSt17__throw_bad_allocv and libstdc++ defines the same
+one -- as an exported, out-of-line, noreturn function whose body is
+`throw bad_alloc()` (libcxx/include/new declares it _LIBCPP_NORETURN
+_LIBCPP_EXPORTED_FROM_ABI).  The runtime declares it by hand, the way the
+file already fakes std::nothrow_t and std::align_val_t rather than
+include <new>.  The exception then unwinds through the runtime's frame,
+which needs that frame's CFI and no landing pad -- nothing in operator new
+has a destructor -- and compiler-rt compiles every runtime with
+-funwind-tables (SANITIZER_COMMON_CFLAGS, compiler-rt/CMakeLists.txt);
+the toolchain adds no -fno-unwind-tables or -fno-asynchronous-unwind-tables
+anywhere.  A host mock of the arrangement -- a weak operator new[] compiled
+-fno-exceptions -fno-rtti -funwind-tables that calls a hand-declared
+std::__throw_bad_alloc(), linked into a program that catches -- prints the
+catch; the same object compiled -fno-unwind-tables
+-fno-asynchronous-unwind-tables terminates, which is the flag doing its
+work.
+
+The stack the exception abandons is unpoisoned as it is for every other
+throw.  ASan does that from its __cxa_throw and _Unwind_RaiseException
+interceptors, both of which call __asan_handle_no_return; under static
+interception only names the link's libraries define are wrapped (0002),
+the list is cut to libc.a and libunwind.a, so __cxa_throw -- libc++abi's
+-- is not wrapped and _Unwind_RaiseException is
+(conformance/checks/wrap-list.allow records both).  __cxa_throw calls
+_Unwind_RaiseException (libcxxabi/src/cxa_exception.cpp), so every throw
+in a binary of this toolchain -- the program's, the downstream trampolines'
+that already throw bad_alloc from uninstrumented code and are caught in
+both flavours, and now the runtime's -- passes through the interceptor
+that is attached.
+
+The declaration is strong, and it is compiled only into the statically
+intercepting runtime.  Strong because in a static C++ link nothing else
+need name _ZSt17__throw_bad_allocv -- libc++abi's operator new throws
+directly, and is replaced anyway -- so the member that defines it,
+libc++.a's new_helpers.cpp.o, is extracted because this object refers to
+it; a weak reference extracts nothing and the call would go to address 0.
+The accepted cost is that a C++ link against this runtime has to provide a
+C++ library, which every C++ link does, and one that does not fails on
+this symbol at link time rather than later; C links do not pull asan_cxx.a
+and are untouched.  Compiled under SANITIZER_STATIC_INTERCEPTION, as
+__asan_wrap_list_present of patch 0002 is, so the shared runtime -- which
+a C program may load, and which the stock resource dir builds from this
+same file -- gains no reference it cannot resolve.
+
+What the throw does not cover, on purpose: a refusal the allocator itself
+reports.  With allocator_may_return_null off, asan_memalign reports and
+dies before operator new sees anything, for new exactly as for malloc; the
+downstream drivers pin the flag on from __asan_default_options, which
+a sealed binary honours.  A size over the maximum is a Report and a null
+under the flag, unchanged.
+
+The suite gains its first C++ cases, sealed_new_refused and
+sealed_new_nothrow_refused, behind the seccomp allow-list with the
+secondary allocator's mmap for an 8MiB block -- the (8MiB, 9MiB) window
+sealed_midrun_refused's wrapper uses -- answered ENOMEM rather than EPERM:
+MmapOrDieOnFatalError tolerates that errno and no other, and an ENOMEM on
+an unhinted mmap maps nothing, so SECCOMP_RET_ERRNO reproduces it exactly
+where 0022's commit needed a SIGSYS handler.  The sealed build catches
+bad_alloc and exits 0, or with std::nothrow prints the null; the plain,
+uninstrumented build of the same file behind the same wrapper prints the
+same line, which is the equivalence the rule asks for; the unsealed
+build is the control, killed at start-up as in every refused case.  The
+runner learns to compile a .cc with a C++ command line (--cxx, --cxx-plain,
+--cxx-sealed) and -std=c++17.
+---
+ compiler-rt/lib/asan/asan_new_delete.cpp | 78 ++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/asan/asan_new_delete.cpp b/compiler-rt/lib/asan/asan_new_delete.cpp
+index b5b1ced..1e995eb 100644
+--- a/compiler-rt/lib/asan/asan_new_delete.cpp
++++ b/compiler-rt/lib/asan/asan_new_delete.cpp
+@@ -18,6 +18,7 @@
+ #include "asan_report.h"
+ #include "asan_stack.h"
+ #include "interception/interception.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ 
+ // C++ operators can't have dllexport attributes on Windows. We export them
+ // anyway by passing extra -export flags to the linker, which is exactly that
+@@ -55,22 +56,95 @@ using namespace __asan;
+ namespace std {
+ struct nothrow_t {};
+ enum class align_val_t: size_t {};
++#if SANITIZER_STATIC_INTERCEPTION
++// libc++'s thrower of std::bad_alloc, declared here for the reason the two
++// types above are faked: the runtime includes no C++ library header, and this
++// is the one function of that library it calls.  libc++ defines it in
++// src/new_helpers.cpp, in a namespace std that is "purposefully not
++// versioned", so the symbol is _ZSt17__throw_bad_allocv with no __1 in it,
++// and libstdc++ defines the same name; both as an exported, out-of-line,
++// noreturn function whose body is `throw bad_alloc()`.  Not weak, on purpose:
++// SealedThrowBadAlloc below says why the reference has to be strong.
++[[noreturn]] void __throw_bad_alloc();
++#endif
+ }  // namespace std
+ 
++// What a sealed binary's operator new does when the allocation is refused:
++// throws std::bad_alloc, as the program's own operator new would have.
++//
++// The rule is the one patch 0022 applies at the primary allocator's commit:
++// the sanitizer's own failures are unreachable; the program's may-fail
++// outcomes stay visible.  For malloc that outcome is a
++// NULL, and under allocator_may_return_null the allocator hands it up as one.
++// For a throwing form of operator new it is std::bad_alloc: libc++abi's
++// operator new (libcxxabi/src/stdlib_new_delete.cpp) loops on malloc and
++// throws when it returns null with no new_handler installed, and a program
++// written `try { p = new T[n]; } catch (const std::bad_alloc &)` goes on from
++// the catch.  This file replaces that operator new -- eight weak definitions
++// under the real mangled names, in libclang_rt.asan_cxx.a, which only a C++
++// link pulls -- and upstream's replacement answers the refusal with
++// ReportOutOfMemory whatever allocator_may_return_null says: the flag makes
++// asan_memalign return the null, and the null is then reported here.  In a
++// sealed binary that is the sanitizer dying where the program's plain build
++// catches and continues -- a difference the sanitizer made rather than one
++// it found.
++// So when the seal is on and a throwing form has a null in hand, the runtime
++// throws what the program's operator new would have, and ReportOutOfMemory
++// is not reached.  The nothrow forms keep returning the null, which is their
++// contract.  Unsealed behaviour is unchanged.  A refusal the allocator itself
++// reports -- allocator_may_return_null off, or a size over the maximum -- is
++// what it was, for new as for malloc.
++//
++// How a runtime compiled with -fno-exceptions throws: it does not; it calls
++// libc++'s std::__throw_bad_alloc(), which does, and the exception unwinds
++// through this frame on its way to the program's handler.  That needs the
++// frame's CFI and nothing more, since nothing here has a destructor to run,
++// and compiler-rt compiles with -funwind-tables (SANITIZER_COMMON_CFLAGS), so
++// the .eh_frame entry is there.  ASan's own part of a throw --
++// __asan_handle_no_return, unpoisoning the stack the exception abandons --
++// runs from the _Unwind_RaiseException interceptor, which __cxa_throw calls
++// and the wrap list attaches (libunwind.a is in the intersection the list is
++// cut to; __cxa_throw, libc++abi's, is not, so its own interceptor is not).
++//
++// Why the declaration is strong and compiled only into the statically
++// intercepting runtime.  Nothing else in a static C++ link need name
++// _ZSt17__throw_bad_allocv -- libc++abi's operator new throws directly, and
++// is replaced by this file anyway -- so the archive member that defines it,
++// libc++.a's new_helpers.cpp.o, is extracted because this object refers to
++// it; a weak reference extracts nothing, and the call would go to address 0.
++// The cost is that a C++ link against this runtime has to provide a C++
++// library, which every C++ link does, and one that does not fails on this
++// symbol at link time rather than later.  C links never see asan_cxx.a.  The
++// reference lives where the runtime's other link-time expectation does,
++// __asan_wrap_list_present of patch 0002: in the runtime whose interceptors
++// the link binds, and not in a shared runtime, which a C program may load.
++static void SealedThrowBadAlloc() {
++#if SANITIZER_STATIC_INTERCEPTION
++  if (SealedInit())
++    std::__throw_bad_alloc();
++#endif
++}
++
+ // TODO(alekseyshl): throw std::bad_alloc instead of dying on OOM.
++// A sealed binary does, through SealedThrowBadAlloc above; the unsealed
++// runtime keeps dying.
+ // For local pool allocation, align to SHADOW_GRANULARITY to match asan
+ // allocator behavior.
+ #define OPERATOR_NEW_BODY(type, nothrow)            \
+   GET_STACK_TRACE_MALLOC;                           \
+   void *res = asan_memalign(0, size, &stack, type); \
+-  if (!nothrow && UNLIKELY(!res))                   \
++  if (!nothrow && UNLIKELY(!res)) {                 \
++    SealedThrowBadAlloc();                          \
+     ReportOutOfMemory(size, &stack);                \
++  }                                                 \
+   return res;
+ #define OPERATOR_NEW_BODY_ALIGN(type, nothrow)                \
+   GET_STACK_TRACE_MALLOC;                                     \
+   void *res = asan_memalign((uptr)align, size, &stack, type); \
+-  if (!nothrow && UNLIKELY(!res))                             \
++  if (!nothrow && UNLIKELY(!res)) {                           \
++    SealedThrowBadAlloc();                                    \
+     ReportOutOfMemory(size, &stack);                          \
++  }                                                           \
+   return res;
+ 
+ // On OS X it's not enough to just provide our own 'operator new' and

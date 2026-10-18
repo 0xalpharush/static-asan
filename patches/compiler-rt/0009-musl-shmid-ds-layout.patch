@@ -1,0 +1,142 @@
+From 2a503f136265bda860b571d114073edc9c23c676 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 19 Aug 2026 02:59:42 +0000
+Subject: [PATCH] [sanitizer_common] describe musl's struct shmid_ds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The patch that turned the ipc_perm and shmid_ds checks on for musl checked
+them on a 64-bit target, where they hold.  On a 32-bit one shmid_ds is not the
+same structure at all, and the three checks it turned on for the timestamps
+fail the build:
+
+  static assertion failed: sizeof(__sanitizer_shmid_ds) == sizeof(shmid_ds)
+  static assertion failed: offsetof(__sanitizer_shmid_ds, shm_atime) ==
+                           offsetof(shmid_ds, shm_atime)
+
+which is the checks doing their job.  What they found is that the description
+in this file is glibc's 32-bit shmid_ds: a 32-bit shm_atime with a padding
+word after it, three times over.  musl's is the time64 shape it uses on every
+32-bit architecture -- the kernel's two halves kept as __shm_atime_lo and
+__shm_atime_hi, six words of them, and then three real 64-bit timestamps at
+the end of the struct that its shmctl assembles out of those halves and that
+are the ones a caller reads.  So the old description put shm_atime where the
+kernel's low half is: a different field, half the width, and holding a
+different value once a timestamp goes past 2038.
+
+Rather than add a third variant to the nest of architecture tests already in
+this struct, give musl its own definition, the way this file already does for
+musl's msghdr.  The 64-bit half of it is what the old description produced on
+a 64-bit target, field for field; the only change there is that the two
+trailing pad words are called __pad1 and __pad2, which is what musl calls
+them, instead of __unused4 and __unused5, so that they are compared under
+their own name rather than through an alias in the conformance allowlist.
+
+The 32-bit description is right for arm, i386, m68k, microblaze, or1k, riscv32
+and sh, which is every 32-bit architecture musl gives this layout to.  It is
+not right for mips or powerpc, whose bits/shm.h are each different again --
+mips keeps the high halves as shorts after shm_nattch, powerpc puts the
+timestamps before shm_segsz.  Those two are not described here because there
+is nothing to check the description against without a target to build for, and
+because the failure if someone does build for one is the same three static
+assertions above, naming shmid_ds, rather than a runtime that reads the wrong
+bytes.
+
+What this fixes is the description and the build, not a runtime that
+misbehaves, and on the target it is for nothing reads the struct at all:
+SANITIZER_INTERCEPT_SHMCTL is gated on SANITIZER_WORDSIZE == 64, so a 32-bit
+build compiles no shmctl interceptor.  On the two 64-bit targets the
+interceptor does exist and uses sizeof(__sanitizer_shmid_ds) -- the total, and
+no field of it -- and the only code anywhere that reads a field is msan's,
+which is not built for a 32-bit Arm target either.  So the reason to fix it is
+that it is what the checks compare against and what the next interceptor would
+be written from; the reason it cannot be left alone is that the build stops.
+---
+ .../sanitizer_platform_limits_posix.h         | 53 ++++++++++++++++++-
+ 1 file changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+index 646236ab6..30ebf7177 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+@@ -250,6 +250,50 @@ struct __sanitizer_ipc_perm {
+ #endif
+ };
+ 
++#if SANITIZER_MUSL
++// musl's, rather than glibc's with the differences guessed at.  On a 32-bit
++// target the two are not the same structure: musl's shmctl fills in a 64-bit
++// shm_atime of its own at the end of the struct out of the __shm_atime_lo and
++// __shm_atime_hi halves the kernel wrote, so the field the description below
++// used to put where the kernel's low half is was a different field with the
++// same name, half the width, and a different value once a timestamp goes past
++// 2038.  On a 64-bit target the layout is unchanged from what was here; only
++// the two trailing pad words are renamed, to what musl calls them, so that they
++// are compared under their own name rather than through an alias.  The three
++// timestamps are spelled u64 and not __sanitizer_time_t because that typedef is
++// three hundred lines further down this file; it is the same width, it is how
++// this struct already spells them for x32, and nothing reads them.
++struct __sanitizer_shmid_ds {
++  __sanitizer_ipc_perm shm_perm;
++  uptr shm_segsz;
++#  if SANITIZER_WORDSIZE == 32
++  unsigned long __shm_atime_lo;
++  unsigned long __shm_atime_hi;
++  unsigned long __shm_dtime_lo;
++  unsigned long __shm_dtime_hi;
++  unsigned long __shm_ctime_lo;
++  unsigned long __shm_ctime_hi;
++  int shm_cpid;
++  int shm_lpid;
++  unsigned long shm_nattch;
++  unsigned long __pad1;
++  unsigned long __pad2;
++  unsigned long __pad3;
++  u64 shm_atime;
++  u64 shm_dtime;
++  u64 shm_ctime;
++#  else
++  u64 shm_atime;
++  u64 shm_dtime;
++  u64 shm_ctime;
++  int shm_cpid;
++  int shm_lpid;
++  unsigned long shm_nattch;
++  unsigned long __pad1;
++  unsigned long __pad2;
++#  endif
++};
++#else
+ struct __sanitizer_shmid_ds {
+   __sanitizer_ipc_perm shm_perm;
+ #if defined(__sparc__)
+@@ -312,6 +356,7 @@ struct __sanitizer_shmid_ds {
+ #endif
+ };
+ #endif
++#endif
+ 
+ #if SANITIZER_LINUX && !SANITIZER_ANDROID
+ extern unsigned struct_msqid_ds_sz;
+@@ -415,14 +460,18 @@ typedef long __sanitizer_suseconds_t;
+ // together as one 64-bit tv_nsec is the same mistake this file used to make
+ // about musl's msg_iovlen: the padding is part of no interface and a caller has
+ // no reason to initialize it.
++//
++// It is written as an unnamed bit-field because that is how musl writes it --
++// an `int :` whose width it computes from sizeof(time_t) - sizeof(long) -- and
++// unlike the __pad1 and __pad2 of its msghdr there is no name to give it.
+ struct __sanitizer_timespec {
+   __sanitizer_time_t tv_sec; /* seconds */
+ #  if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+-  int __pad;
++  int : 32;
+   long tv_nsec; /* nanoseconds */
+ #  else
+   long tv_nsec; /* nanoseconds */
+-  int __pad;
++  int : 32;
+ #  endif
+ };
+ #else

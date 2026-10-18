@@ -1,0 +1,88 @@
+From: Theorem Labs
+Subject: __init_tls: keep a static program's TLS block in .bss, never map it
+
+Upstream sizes builtin_tls for a small block, 16 words, and gets any
+larger one from an anonymous mmap during start-up, with no address hint.
+In a sanitizer binary that mmap runs before __asan_init, and the kernel
+model these binaries are verified against may place an unhinted mapping
+at any free address, including inside the shadow the runtime reserves
+next with MAP_FIXED_NOREPLACE.  The reservation then fails with EEXIST,
+which is not a refusal the model can filter out, and the sealed runtime
+spins.  Measured on 2,038 riscv64 asan/asanubsan binaries: 88 make this
+mmap first (every one whose PT_TLS memsz is 136 or more), and with the
+block placed at 0x80000000 all 64 of them that carry halting statements
+spin.
+
+Make the buffer large enough instead: 131072 bytes of space, against a
+largest PT_TLS memsz of 30,369 bytes over every riscv64 binary built
+with this toolchain (9,748 ELF files in one build, 9,008 in another).
+The buffer is .bss, so the files do not grow; it is part of the image
+the kernel maps at exec, below the shadow.  A block that does not fit is
+a fatal error, not a fallback mapping: one line to fd 2, then a crash,
+before main, on every run.  Raw syscalls, as before: nothing that needs
+TLS exists yet.  The line names the capacity, so a tool can read from a
+binary's bytes which __init_tls it carries.
+
+This replaces 0002, which checked the result of the mapping that is no
+longer made.  Dynamic programs are unchanged (ldso has its own buffer).
+Every flavour links this one libc.a, so plain and instrumented programs
+both stop mapping.
+
+Applies on top of 0001 (v1.2.6-20, f21a9653).
+--- a/src/env/__init_tls.c
++++ b/src/env/__init_tls.c
+@@ -36,10 +36,22 @@ int __init_tp(void *p)
+ 	return 0;
+ }
+ 
++/* The main thread's TLS block of a static program lives here, in .bss,
++ * at an address the link fixes.  Upstream reserves 16 words and maps any
++ * larger block with an anonymous mmap at start-up, an mmap with no address
++ * hint that the kernel may place anywhere free: in a sanitizer binary that
++ * includes the range the sanitizer's shadow reservation is about to claim.
++ * This buffer is sized above every block the toolchain is used for, and a
++ * block that does not fit is a fatal start-up error (static_init_tls),
++ * never a mapping. */
++#define BUILTIN_TLS_SPACE 131072
++#define BUILTIN_TLS_STR_(x) #x
++#define BUILTIN_TLS_STR(x) BUILTIN_TLS_STR_(x)
++
+ static struct builtin_tls {
+ 	char c;
+ 	struct pthread pt;
+-	void *space[16];
++	void *space[BUILTIN_TLS_SPACE/sizeof(void *)];
+ } builtin_tls[1];
+ #define MIN_TLS_ALIGN offsetof(struct builtin_tls, pt)
+ 
+@@ -140,19 +152,18 @@ static void static_init_tls(size_t *aux)
+ 		+ MIN_TLS_ALIGN-1 & -MIN_TLS_ALIGN;
+ 
+ 	if (libc.tls_size > sizeof builtin_tls) {
+-#ifndef SYS_mmap2
+-#define SYS_mmap2 SYS_mmap
+-#endif
+-		mem = (void *)__syscall(
+-			SYS_mmap2,
+-			0, libc.tls_size, PROT_READ|PROT_WRITE,
+-			MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+-		/* -4095...-1 cast to void * will crash on dereference anyway,
+-		 * so don't bloat the init code checking for error codes and
+-		 * explicitly calling a_crash(). */
+-	} else {
+-		mem = builtin_tls;
++		/* No fallback mapping.  Say why on fd 2 and die: raw
++		 * syscalls, since nothing that needs TLS exists yet.  The
++		 * exit_group is only reached if the store to address 0 did
++		 * not fault. */
++		static const char msg[] = "musl: static TLS block does not "
++			"fit the " BUILTIN_TLS_STR(BUILTIN_TLS_SPACE)
++			"-byte builtin_tls buffer; refusing to map it\n";
++		__syscall(SYS_write, 2, msg, sizeof msg - 1);
++		a_crash();
++		__syscall(SYS_exit_group, 127);
+ 	}
++	mem = builtin_tls;
+ 
+ 	/* Failure to initialize thread pointer is always fatal. */
+ 	if (__init_tp(__copy_tls(mem)) < 0)

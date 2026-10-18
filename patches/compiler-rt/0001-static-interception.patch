@@ -1,0 +1,303 @@
+From e45548d249e0964b906e36364a71621dff514fe6 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 22:37:22 -0700
+Subject: [PATCH] [compiler-rt] add a link-time interception mode for static
+ runtimes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Interception is resolved at run time today: the interceptor is defined
+under the intercepted name, and the original function is found with
+dlsym(RTLD_NEXT, ...).  A fully static link has neither half of what that
+needs -- there is no second definition of the function to find, and no
+dynamic symbol table to search -- so every REAL() pointer stays null and
+the runtime dies the first time it calls one.  That is why the tripwire in
+DoesNotSupportStaticLinking() exists at all.
+
+COMPILER_RT_STATIC_INTERCEPTION builds the static runtimes so the linker
+attaches the interceptors instead.  The interceptor is emitted as
+__wrap_<func>, the original is reached through __real_<func>, and a link
+against the runtime passes -Wl,--wrap=<func> for each one.  Everything is
+then resolved before the program starts: REAL(<func>) is initialized from
+&__real_<func> as a static initializer, INTERCEPT_FUNCTION() has nothing
+left to do at run time, and the tripwire is no longer telling the truth,
+so its body goes away.
+
+The rule that the interceptor is named __wrap_<func> has to hold for every
+one of them, since the alternative is not a link error but a silently
+detached interceptor.  That means all three places a wrapper name is
+emitted: DECLARE_WRAPPER for the C ones, ASM_TRAMPOLINE_ALIAS for the
+assembly ones (vfork, and hwasan's setjmp), and the hand-rolled asm block
+for s390's __tls_get_offset.
+
+REAL(<func>) stays a mutable pointer variable rather than becoming a
+direct call to __real_<func>: ASSIGN_REAL() assigns to it, and the aarch64
+vfork interceptor declares and calls through the variable by its mangled
+name from assembly.  Only its initializer changes.
+
+The reference to __real_<func> is weak so that a libc missing a function
+leaves a null pointer instead of failing the link, matching what the
+run-time path produced for a function dlsym could not find.
+
+The define is set for the static asan archives -- the runtime, its C++
+half, the static-only half and the preinit stub, which share one list of
+definitions and none of which defines an interceptor outside the runtime
+itself today.  The shared runtime is loaded by the dynamic linker, which is
+the case dlsym-based interception is for, and it keeps it.
+---
+ compiler-rt/CMakeLists.txt                    |  9 ++++
+ compiler-rt/lib/asan/CMakeLists.txt           |  6 +++
+ compiler-rt/lib/interception/interception.h   | 54 ++++++++++++++++---
+ .../lib/interception/interception_linux.h     | 10 +++-
+ .../lib/sanitizer_common/sanitizer_asm.h      | 34 +++++++++---
+ .../sanitizer_common_interceptors.inc         | 10 ++++
+ 6 files changed, 109 insertions(+), 14 deletions(-)
+
+diff --git a/compiler-rt/CMakeLists.txt b/compiler-rt/CMakeLists.txt
+index 2c52788de..89c2bc5b2 100644
+--- a/compiler-rt/CMakeLists.txt
++++ b/compiler-rt/CMakeLists.txt
+@@ -98,6 +98,15 @@ else()
+ endif()
+ set(COMPILER_RT_HWASAN_WITH_INTERCEPTORS ${COMPILER_RT_HWASAN_WITH_INTERCEPTORS_DEFAULT} CACHE BOOL "Enable libc interceptors in HWASan (testing mode)")
+ 
++# Interception normally needs a dynamic symbol table: the interceptor is defined
++# under the intercepted name and the original is found with dlsym(RTLD_NEXT).
++# With this on, the static sanitizer runtimes are built to be attached by the
++# linker instead (__wrap_<func>/__real_<func>), which is what makes a fully
++# static link work.  A link using such a runtime must pass -Wl,--wrap=<func> for
++# every intercepted function; the runtime is installed with a response file
++# listing them.
++set(COMPILER_RT_STATIC_INTERCEPTION OFF CACHE BOOL "Attach interceptors at link time with ld --wrap instead of at run time with dlsym")
++
+ set(COMPILER_RT_BAREMETAL_BUILD OFF CACHE BOOL
+   "Build for a bare-metal target.")
+ 
+diff --git a/compiler-rt/lib/asan/CMakeLists.txt b/compiler-rt/lib/asan/CMakeLists.txt
+index e2f39f224..a8882cab1 100644
+--- a/compiler-rt/lib/asan/CMakeLists.txt
++++ b/compiler-rt/lib/asan/CMakeLists.txt
+@@ -134,6 +134,12 @@ set(ASAN_DYNAMIC_DEFINITIONS
+   ${ASAN_COMMON_DEFINITIONS} ASAN_DYNAMIC=1)
+ append_list_if(WIN32 INTERCEPTION_DYNAMIC_CRT ASAN_DYNAMIC_DEFINITIONS)
+ 
++# Deliberately after ASAN_DYNAMIC_DEFINITIONS is taken: link-time interception
++# applies to the static runtime only.  The shared runtime is brought in by the
++# dynamic linker, which is exactly the case dlsym-based interception handles.
++append_list_if(COMPILER_RT_STATIC_INTERCEPTION SANITIZER_STATIC_INTERCEPTION=1
++  ASAN_COMMON_DEFINITIONS)
++
+ set(ASAN_DYNAMIC_CFLAGS ${ASAN_CFLAGS})
+ append_list_if(COMPILER_RT_HAS_FTLS_MODEL_INITIAL_EXEC
+   -ftls-model=initial-exec ASAN_DYNAMIC_CFLAGS)
+diff --git a/compiler-rt/lib/interception/interception.h b/compiler-rt/lib/interception/interception.h
+index 3cb6b4466..497823513 100644
+--- a/compiler-rt/lib/interception/interception.h
++++ b/compiler-rt/lib/interception/interception.h
+@@ -23,6 +23,17 @@
+ #  error "Interception doesn't work on this operating system."
+ #endif
+ 
++// Static interception mode.  Interception is normally resolved at run time:
++// the interceptor is defined under the intercepted name, and the address of the
++// original function is looked up with dlsym(RTLD_NEXT, ...).  Neither half of
++// that works in a fully static link -- there is no dynamic symbol table to
++// search and no second definition to find -- so in this mode the interceptor is
++// attached by the linker instead: it is defined as __wrap_<func>, the original
++// is reached through __real_<func>, and the link must pass -Wl,--wrap=<func>
++// for every intercepted function.  Set by COMPILER_RT_STATIC_INTERCEPTION for
++// the static sanitizer runtimes only, and defaulted in sanitizer_asm.h, which
++// the assembly interceptors need it from as well.
++
+ // These typedefs should be used only in the interceptor definitions to replace
+ // the standard system types (e.g. SSIZE_T instead of ssize_t)
+ // On Windows the system headers (basetsd.h) provide a conflicting definition
+@@ -196,6 +207,15 @@ const interpose_substitution substitution_##func_name[]             \
+ #  else
+ #   define __ASM_WEAK_WRAPPER(func) ".weak " #func "\n"
+ #  endif  // SANITIZER_FREEBSD || SANITIZER_NETBSD
++#  if SANITIZER_STATIC_INTERCEPTION
++// The linker attaches the interceptor (ld --wrap=func), so it has to be called
++// __wrap_func, and the plain name is left alone for libc to define.
++#   define __ASM_WRAPPER_SYM(func) "__wrap_" #func
++#   define __ASM_WRAPPER_BINDING(func) ".globl __wrap_" #func "\n"
++#  else
++#   define __ASM_WRAPPER_SYM(func) #func
++#   define __ASM_WRAPPER_BINDING(func) __ASM_WEAK_WRAPPER(func)
++#  endif  // SANITIZER_STATIC_INTERCEPTION
+ #  if defined(__arm__) || defined(__aarch64__)
+ #   define ASM_TYPE_FUNCTION_STR "%function"
+ #  else
+@@ -209,8 +229,9 @@ const interpose_substitution substitution_##func_name[]             \
+        INTERCEPTOR_ATTRIBUTE __attribute__((weak)) ALIAS(WRAP(func));          \
+      asm(                                                                      \
+        ".text\n"                                                               \
+-       __ASM_WEAK_WRAPPER(func)                                                \
+-       ".set " #func ", " SANITIZER_STRINGIFY(TRAMPOLINE(func)) "\n"           \
++       __ASM_WRAPPER_BINDING(func)                                             \
++       ".set " __ASM_WRAPPER_SYM(func) ", "                                    \
++         SANITIZER_STRINGIFY(TRAMPOLINE(func)) "\n"                            \
+        ".globl " SANITIZER_STRINGIFY(TRAMPOLINE(func)) "\n"                    \
+        ".type  " SANITIZER_STRINGIFY(TRAMPOLINE(func)) ", "                    \
+          ASM_TYPE_FUNCTION_STR "\n"                                            \
+@@ -237,9 +258,15 @@ const interpose_substitution substitution_##func_name[]             \
+ #  else
+ #   define __ATTRIBUTE_WEAK_WRAPPER __attribute__((weak))
+ #  endif  // SANITIZER_FREEBSD || SANITIZER_NETBSD
+-#  define DECLARE_WRAPPER(ret_type, func, ...)                                 \
+-     extern "C" ret_type func(__VA_ARGS__)                                     \
+-       INTERCEPTOR_ATTRIBUTE __ATTRIBUTE_WEAK_WRAPPER ALIAS(WRAP(func));
++#  if SANITIZER_STATIC_INTERCEPTION
++#   define DECLARE_WRAPPER(ret_type, func, ...)                                \
++      extern "C" ret_type __wrap_##func(__VA_ARGS__)                           \
++        INTERCEPTOR_ATTRIBUTE ALIAS(WRAP(func));
++#  else
++#   define DECLARE_WRAPPER(ret_type, func, ...)                                \
++      extern "C" ret_type func(__VA_ARGS__)                                    \
++        INTERCEPTOR_ATTRIBUTE __ATTRIBUTE_WEAK_WRAPPER ALIAS(WRAP(func));
++#  endif  // SANITIZER_STATIC_INTERCEPTION
+ # endif  // ASM_INTERCEPTOR_TRAMPOLINE_SUPPORT
+ #endif
+ 
+@@ -289,7 +316,20 @@ const interpose_substitution substitution_##func_name[]             \
+ // macros does its job. In exceptional cases you may need to call REAL(foo)
+ // without defining INTERCEPTOR(..., foo, ...). For example, if you override
+ // foo with an interceptor for other function.
+-#if !SANITIZER_APPLE && !SANITIZER_FUCHSIA
++#if SANITIZER_STATIC_INTERCEPTION && !SANITIZER_APPLE && !SANITIZER_FUCHSIA
++// ld --wrap=func resolves __real_func to the function the interceptor replaced,
++// so REAL(func) can be initialized at link time and INTERCEPT_FUNCTION has
++// nothing left to do.  REAL(func) stays a mutable pointer: ASSIGN_REAL() writes
++// to it, and the aarch64 vfork interceptor calls through the variable itself.
++// The reference is weak so that a libc missing func leaves a null pointer
++// rather than failing the link; the call sites that can hit that already check.
++#  define DEFINE_REAL(ret_type, func, ...)                            \
++    extern "C" __attribute__((weak)) ret_type __real_##func(__VA_ARGS__); \
++    typedef ret_type (*FUNC_TYPE(func))(__VA_ARGS__);                 \
++    namespace __interception {                                        \
++    FUNC_TYPE(func) PTR_TO_REAL(func) = &__real_##func;               \
++    }
++#elif !SANITIZER_APPLE && !SANITIZER_FUCHSIA
+ #  define DEFINE_REAL(ret_type, func, ...)            \
+     typedef ret_type (*FUNC_TYPE(func))(__VA_ARGS__); \
+     namespace __interception {                        \
+@@ -352,7 +392,7 @@ const interpose_substitution substitution_##func_name[]             \
+ // so we use casts via uintptr_t (the local __sanitizer::uptr equivalent).
+ namespace __interception {
+ 
+-#if defined(__ELF__) && !SANITIZER_FUCHSIA
++#if defined(__ELF__) && !SANITIZER_FUCHSIA && !SANITIZER_STATIC_INTERCEPTION
+ // The use of interceptors makes many sanitizers unusable for static linking.
+ // Define a function, if called, will cause a linker error (undefined _DYNAMIC).
+ // However, -static-pie (which is not common) cannot be detected at link time.
+diff --git a/compiler-rt/lib/interception/interception_linux.h b/compiler-rt/lib/interception/interception_linux.h
+index 2e01ff445..a525933b9 100644
+--- a/compiler-rt/lib/interception/interception_linux.h
++++ b/compiler-rt/lib/interception/interception_linux.h
+@@ -28,6 +28,12 @@ bool InterceptFunction(const char *name, const char *ver, uptr *ptr_to_real,
+                        uptr func, uptr trampoline);
+ }  // namespace __interception
+ 
++#if SANITIZER_STATIC_INTERCEPTION
++// The linker already did it: the interceptor is __wrap_func and REAL(func) was
++// initialized from __real_func.  Nothing can fail at run time, so this always
++// reports success.
++#define INTERCEPT_FUNCTION_LINUX_OR_FREEBSD(func) true
++#else
+ // Cast func to type of REAL(func) before casting to uptr in case it is an
+ // overloaded function, which is the case for some glibc functions when
+ // _FORTIFY_SOURCE is used. This disambiguates which overload to use.
+@@ -36,9 +42,11 @@ bool InterceptFunction(const char *name, const char *ver, uptr *ptr_to_real,
+       #func, (::__interception::uptr *)&REAL(func),          \
+       (::__interception::uptr)(decltype(REAL(func)))&(func), \
+       (::__interception::uptr) &TRAMPOLINE(func))
++#endif  // SANITIZER_STATIC_INTERCEPTION
+ 
+ // dlvsym is a GNU extension supported by some other platforms.
+-#if SANITIZER_GLIBC || SANITIZER_FREEBSD || SANITIZER_NETBSD
++#if (SANITIZER_GLIBC || SANITIZER_FREEBSD || SANITIZER_NETBSD) && \
++    !SANITIZER_STATIC_INTERCEPTION
+ #define INTERCEPT_FUNCTION_VER_LINUX_OR_FREEBSD(func, symver) \
+   ::__interception::InterceptFunction(                        \
+       #func, symver,                                          \
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_asm.h b/compiler-rt/lib/sanitizer_common/sanitizer_asm.h
+index 30e9d1518..1958ff6d8 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_asm.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_asm.h
+@@ -10,6 +10,16 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++// Static interception mode: the interceptor is attached by the linker as
++// __wrap_<func> rather than being defined under the intercepted name, which is
++// what makes interception work in a fully static link.  Set for the static
++// sanitizer runtimes by COMPILER_RT_STATIC_INTERCEPTION; see interception.h for
++// the whole scheme.  It is defaulted here because the assembly interceptors
++// need it too, and they cannot include interception.h.
++#ifndef SANITIZER_STATIC_INTERCEPTION
++#  define SANITIZER_STATIC_INTERCEPTION 0
++#endif
++
+ // Some toolchains do not support .cfi asm directives, so we have to hide
+ // them inside macros.
+ #if defined(__clang__) ||                                                      \
+@@ -107,17 +117,29 @@
+      defined(__sparc__)
+ // For details, see interception.h
+ #  define ASM_WRAPPER_NAME(symbol) __interceptor_##symbol
+-#  define ASM_TRAMPOLINE_ALIAS(symbol, name)                                   \
+-         .weak symbol;                                                         \
+-         .set symbol, ASM_WRAPPER_NAME(name)
++#  if SANITIZER_STATIC_INTERCEPTION
++#   define ASM_TRAMPOLINE_ALIAS(symbol, name)                                  \
++          .globl __wrap_##symbol;                                              \
++          .set __wrap_##symbol, ASM_WRAPPER_NAME(name)
++#  else
++#   define ASM_TRAMPOLINE_ALIAS(symbol, name)                                  \
++          .weak symbol;                                                        \
++          .set symbol, ASM_WRAPPER_NAME(name)
++#  endif
+ #  define ASM_INTERCEPTOR_TRAMPOLINE(name)
+ #  define ASM_INTERCEPTOR_TRAMPOLINE_SUPPORT 0
+ # else  // Architecture supports interceptor trampoline
+ // Keep trampoline implementation in sync with interception/interception.h
+ #  define ASM_WRAPPER_NAME(symbol) ___interceptor_##symbol
+-#  define ASM_TRAMPOLINE_ALIAS(symbol, name)                                   \
+-         .weak symbol;                                                         \
+-         .set symbol, __interceptor_trampoline_##name
++#  if SANITIZER_STATIC_INTERCEPTION
++#   define ASM_TRAMPOLINE_ALIAS(symbol, name)                                  \
++          .globl __wrap_##symbol;                                              \
++          .set __wrap_##symbol, __interceptor_trampoline_##name
++#  else
++#   define ASM_TRAMPOLINE_ALIAS(symbol, name)                                  \
++          .weak symbol;                                                        \
++          .set symbol, __interceptor_trampoline_##name
++#  endif
+ #  define ASM_INTERCEPTOR_TRAMPOLINE(name)                                     \
+          .weak __interceptor_##name;                                           \
+          .set __interceptor_##name, ASM_WRAPPER_NAME(name);                    \
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+index 24a8a2d4d..69439f830 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+@@ -5619,8 +5619,18 @@ asm(
+   ".text\n"
+ // The __intercept_ version has to exist, so that gen_dynamic_list.py
+ // exports our symbol.
++#if SANITIZER_STATIC_INTERCEPTION
++// This is the one interceptor whose wrapper is written out by hand rather than
++// by DECLARE_WRAPPER or ASM_TRAMPOLINE_ALIAS, so it needs its own copy of the
++// rule that the interceptor is named __wrap_<func> in this mode.  Getting it
++// wrong is silent: the interceptor would keep the libc name, no __wrap_ symbol
++// would exist for the wrap list to find, and __real_ would stay null.
++  ".globl __wrap___tls_get_offset\n"
++  ".set __wrap___tls_get_offset, __interceptor___tls_get_offset\n"
++#else
+   ".weak __tls_get_offset\n"
+   ".set __tls_get_offset, __interceptor___tls_get_offset\n"
++#endif
+   ".global __interceptor___tls_get_offset\n"
+   ".type __interceptor___tls_get_offset, @function\n"
+   "__interceptor___tls_get_offset:\n"

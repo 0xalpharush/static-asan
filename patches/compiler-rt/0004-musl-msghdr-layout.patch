@@ -1,0 +1,116 @@
+From c308d88eed398f7ed84d3dd82bb2812491186924 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 22:37:23 -0700
+Subject: [PATCH] [sanitizer_common] describe musl's struct msghdr and cmsghdr
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: These are described with glibc's layout for everything that is not Apple,
+with a comment saying that many implementations do not conform to POSIX.
+musl does conform: msg_iovlen and msg_controllen are 32 bits with an
+explicit padding word beside them, where glibc has one 64-bit field.  The
+totals match, so CHECK_TYPE_SIZE passes and the per-field offset checks
+were switched off for musl instead -- on the grounds that the offsets are
+compatible, which is true of the fields and not of their contents.
+
+The padding is not part of any interface and a caller has no reason to
+initialize it.  musl zeroes it only in its own copy inside the call, so
+what the interceptor reads is the caller's uninitialized word as the high
+half of msg_iovlen, and sendmsg on an ordinary conforming program becomes
+
+  AddressSanitizer: unknown-crash on address 0xeeefeadf92a000b0
+  READ of size 17216961071324069904
+
+Give musl its own definition, padding and all, and turn the offset checks
+back on for it so the two cannot drift apart again.
+---
+ .../sanitizer_platform_limits_posix.cpp       | 11 +++--
+ .../sanitizer_platform_limits_posix.h         | 40 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+index b3e717591..8e514efec 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+@@ -1067,24 +1067,23 @@ CHECK_SIZE_AND_OFFSET(iovec, iov_base);
+ CHECK_SIZE_AND_OFFSET(iovec, iov_len);
+ 
+ // In POSIX, int msg_iovlen; socklen_t msg_controllen; socklen_t cmsg_len; but
+-// many implementations don't conform to the standard. Since we pick the
+-// non-conforming glibc definition, exclude the checks for musl (incompatible
+-// sizes but compatible offsets).
++// many implementations don't conform to the standard, so the definition is
++// picked per libc and every field is checked for the ones that have one.
+ CHECK_TYPE_SIZE(msghdr);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_name);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_namelen);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_iov);
+-#if SANITIZER_GLIBC || SANITIZER_ANDROID
++#if SANITIZER_GLIBC || SANITIZER_ANDROID || SANITIZER_MUSL
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_iovlen);
+ #endif
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_control);
+-#if SANITIZER_GLIBC || SANITIZER_ANDROID
++#if SANITIZER_GLIBC || SANITIZER_ANDROID || SANITIZER_MUSL
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_controllen);
+ #endif
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_flags);
+ 
+ CHECK_TYPE_SIZE(cmsghdr);
+-#if SANITIZER_GLIBC || SANITIZER_ANDROID
++#if SANITIZER_GLIBC || SANITIZER_ANDROID || SANITIZER_MUSL
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_len);
+ #endif
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_level);
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+index 005ff2762..4b969f8ac 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+@@ -469,6 +469,46 @@ struct __sanitizer_cmsghdr {
+   int cmsg_level;
+   int cmsg_type;
+ };
++#elif SANITIZER_MUSL
++// musl conforms to POSIX: int msg_iovlen, socklen_t msg_controllen and
++// socklen_t cmsg_len, padded on 64-bit so that the struct is still the size the
++// kernel expects.  The padding belongs to no interface and a caller has no
++// reason to initialize it, so describing these fields the way the libc below
++// this one does -- one 64-bit field where musl has a 32-bit one and a hole --
++// makes the sanitizer read uninitialized bits as part of a length.
++#  if SANITIZER_WORDSIZE == 64 && defined(__BYTE_ORDER__) && \
++      __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++#    define SANITIZER_MUSL_PAD_BEFORE(name) int name;
++#    define SANITIZER_MUSL_PAD_AFTER(name)
++#  elif SANITIZER_WORDSIZE == 64
++#    define SANITIZER_MUSL_PAD_BEFORE(name)
++#    define SANITIZER_MUSL_PAD_AFTER(name) int name;
++#  else
++#    define SANITIZER_MUSL_PAD_BEFORE(name)
++#    define SANITIZER_MUSL_PAD_AFTER(name)
++#  endif
++struct __sanitizer_msghdr {
++  void *msg_name;
++  unsigned msg_namelen;
++  struct __sanitizer_iovec *msg_iov;
++  SANITIZER_MUSL_PAD_BEFORE(__pad1)
++  int msg_iovlen;
++  SANITIZER_MUSL_PAD_AFTER(__pad1)
++  void *msg_control;
++  SANITIZER_MUSL_PAD_BEFORE(__pad2)
++  unsigned msg_controllen;
++  SANITIZER_MUSL_PAD_AFTER(__pad2)
++  int msg_flags;
++};
++struct __sanitizer_cmsghdr {
++  SANITIZER_MUSL_PAD_BEFORE(__pad1)
++  unsigned cmsg_len;
++  SANITIZER_MUSL_PAD_AFTER(__pad1)
++  int cmsg_level;
++  int cmsg_type;
++};
++#  undef SANITIZER_MUSL_PAD_BEFORE
++#  undef SANITIZER_MUSL_PAD_AFTER
+ #else
+ // In POSIX, int msg_iovlen; socklen_t msg_controllen; socklen_t cmsg_len; but
+ // many implementations don't conform to the standard.

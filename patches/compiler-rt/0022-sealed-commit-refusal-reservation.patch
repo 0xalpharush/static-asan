@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 16 Sep 2026 18:27:27 +0000
+Subject: [PATCH] [compiler-rt] sealed init: repair the arena reservation a
+ refused commit tore
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Patch 0015 sorted the failures a sealed runtime meets into two classes
+and 0016 closed the enumeration: an allocation the runtime cannot get for
+itself is a spin, and a malloc the program cannot get is the program's --
+a report or, under allocator_may_return_null, a NULL.  There is one
+refusal that is both at once.  The line this patch
+implements is: the sanitizer's own failures are unreachable; the program's
+may-fail outcomes stay visible.
+
+The site is the primary allocator's user-region commit.  The arena is one
+PROT_NONE reservation (ReservedAddressRange::Init; 128GiB on riscv64, 4TiB
+on x86_64 and aarch64, plus one size class of alignment slack), and each
+size class commits its region into it kUserMapSize at a time --
+primary64.h, PopulateFreeArray, through MapWithCallback and
+ReservedAddressRange::Map: mmap(addr, 256KiB, PROT_READ|PROT_WRITE,
+MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED).  MmapFixedImpl tolerates ENOMEM on
+that call and returns null; MapWithCallback returns false, PopulateFreeArray
+returns false, and asan_allocator.cpp's Allocate answers as
+allocator_may_return_null says, NULL or ReportOutOfMemory.  That is the
+program's may-fail outcome and it is right: the plain build's malloc fails
+on the same budget, and 0015 left it where it was on purpose.
+
+What was not seen is that the refusal is destructive.  mmap_region in
+mm/mmap.c unmaps whatever MAP_FIXED's range holds before it charges the new
+pages ("Unmap any existing mapping in the area", then "Private writable
+mapping: check memory availability"), so an ENOMEM from the charge leaves
+[addr, addr + 256KiB) unmapped: the reservation has a hole where the commit
+was asked for.  The arena's invariant -- every byte committed or reserved,
+so that nothing else can be placed there -- is broken.  An unhinted mmap
+made later, the runtime's or the program's, can be placed in the hole, and
+the class's next commit maps over it with MAP_FIXED, unchecked: two things
+at one address, and no report.  In the model these binaries are verified
+against, ENOMEM on a commit followed by a grant in the hole is an admitted
+run, so it is a run the sealed binary has to be correct on.
+
+One function, ReservedAddressRange::Map in sanitizer_posix_libcdep.cpp,
+which both commits reach -- the region data at primary64.h's
+PopulateFreeArray and the free array at EnsureFreeArraySpace.  On the null,
+a sealed binary re-reserves the same range, with MmapFixedImpl's rounding:
+PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED_NOREPLACE,
+the flags the shadow is reserved with since 0019, and only the address
+asked for is accepted.  Then it returns the null it was going to return,
+so the NULL reaches the program.  Any other answer -- EEXIST because
+something is there already, an errno, a kernel that read the flag as a
+hint and mapped elsewhere -- is the arena's invariant not restored, the
+runtime's own failure, and takes SealedHangOnAllocationFailure: the spin.
+There is no spin on the NULL path itself.  The free-array commit's null
+is already a spin at its ReturnToAllocator caller (0016) and stays one:
+repair, then spin.  The re-reserve is not counted against mmap_limit_mb,
+as the reservation it restores was not.  Unsealed behaviour is unchanged.
+
+The suite gains three cases on one program -- sealed_commit_refused and
+its _norepair and _occupied twins -- behind the seccomp allow-list with
+the commit picked out by shape: PROT_READ|PROT_WRITE, exactly
+MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, exactly kUserMapSize.  Every user and
+free-array commit ASan's configuration makes is that size (the cache asks
+for at most 64KiB of chunks at a time, so RoundUpTo(., kUserMapSize) is
+always one step), and nothing else the sealed runtime maps is.  A seccomp
+ERRNO refusal would not do: the kernel performs nothing, the reservation
+stays whole, and the repair's MAP_FIXED_NOREPLACE would be answered EEXIST
+by the kernel itself.  So the wrapper answers SECCOMP_RET_TRAP and the
+program's SIGSYS handler does what mmap_region does -- unmaps the range,
+returns ENOMEM -- and the hole is reproduced rather than assumed.  With
+the re-reserve left to the kernel, malloc returns NULL, the program's own
+MAP_FIXED_NOREPLACE probe of the range answers EEXIST, and it exits 0;
+with the re-reserve killed by the filter, the sealed build dies by SIGSYS
+after its start line, which is the call being made; with the re-reserve
+answered EEXIST, it spins.  The unsealed build is the control in all
+three, killed at start-up as in every refused case.
+---
+ .../sanitizer_common/sanitizer_posix_libcdep.cpp | 59 +++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+index 975d7c0..47f878d 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+@@ -439,11 +439,66 @@ uptr ReservedAddressRange::Init(uptr size, const char *name, uptr fixed_addr) {
+   return reinterpret_cast<uptr>(base_);
+ }
+ 
++#if SANITIZER_LINUX
++#  ifndef MAP_FIXED_NOREPLACE
++#    define MAP_FIXED_NOREPLACE 0x100000
++#  endif
++// A MAP_FIXED commit the kernel refused with ENOMEM is not a no-op.  Linux
++// unmaps whatever the range held before it charges the new pages
++// (mm/mmap.c, mmap_region: "Unmap any existing mapping in the area" comes
++// before "Private writable mapping: check memory availability"), so when the
++// charge is what fails, [addr, addr + size) is left unmapped.  For the primary
++// allocator that range was part of the PROT_NONE reservation
++// ReservedAddressRange::Init took for the whole arena, and the allocator's
++// invariant -- every byte of the arena is committed or reserved, so nothing
++// else can be placed there -- has a hole in it: an unhinted mmap made later,
++// by the runtime or the program, can land in the hole, and the next commit
++// of that size class would map over it with MAP_FIXED, silently.
++//
++// Two different things happen at that refusal, and they are kept apart.  The
++// null MmapFixedOrDieOnFatalError returns is the program's outcome: the
++// allocator hands it up as a malloc that failed, which under
++// allocator_may_return_null is the NULL the program's plain build can also
++// get from its malloc, and that stays visible -- no spin here.  The hole is
++// the runtime's: a sealed binary puts the reservation back, exactly the range
++// the commit tore, PROT_NONE with MAP_FIXED_NOREPLACE, which the kernel
++// refuses with EEXIST where MAP_FIXED would have replaced.  Only the address
++// asked for is accepted, which also covers a kernel old enough to read the
++// flag as a hint.  Any other answer means the arena's invariant could not be
++// restored, and that is the runtime failing to get memory for itself: the
++// spin of patch 0015 (SealedHangOnAllocationFailure).  Unsealed behaviour is
++// unchanged.
++//
++// The re-reserve is not counted against mmap_limit_mb, as the reservation it
++// restores was not, and the failed commit incremented nothing.  The rounding
++// is MmapFixedImpl's, so the range is the one the kernel was asked for.
++static void SealedRepairReservation(uptr fixed_addr, uptr size) {
++  if (!SealedInit())
++    return;
++  size = RoundUpTo(size, GetPageSizeCached());
++  fixed_addr = RoundDownTo(fixed_addr, GetPageSizeCached());
++  uptr res = internal_mmap(reinterpret_cast<void *>(fixed_addr), size,
++                           PROT_NONE,
++                           MAP_PRIVATE | MAP_ANON | MAP_NORESERVE |
++                               MAP_FIXED_NOREPLACE,
++                           -1, 0);
++  if (res != fixed_addr)
++    SealedHangOnAllocationFailure();
++}
++#endif
++
+ // Uses fixed_addr for now.
+ // Will use offset instead once we've implemented this function for real.
+ uptr ReservedAddressRange::Map(uptr fixed_addr, uptr size, const char *name) {
+-  return reinterpret_cast<uptr>(
+-      MmapFixedOrDieOnFatalError(fixed_addr, size, name));
++  void *res = MmapFixedOrDieOnFatalError(fixed_addr, size, name);
++#if SANITIZER_LINUX
++  // Null is the one tolerated failure, ENOMEM on the MAP_FIXED commit; every
++  // other errno died inside the wrapper.  The commit may have torn the
++  // reservation it was made inside: see SealedRepairReservation.
++  if (UNLIKELY(!res))
++    SealedRepairReservation(fixed_addr, size);
++#endif
++  return reinterpret_cast<uptr>(res);
+ }
+ 
+ uptr ReservedAddressRange::MapOrDie(uptr fixed_addr, uptr size,

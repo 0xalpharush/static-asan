@@ -1,0 +1,336 @@
+From 2f2ff9990e379bb8ae8aad6d5cd278fe910b31cb Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 22:37:23 -0700
+Subject: [PATCH] [compiler-rt] generate the --wrap list for a statically
+ intercepting runtime
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: __wrap_<func> and __real_<func> mean nothing to the linker unless the link
+also passes --wrap=<func> for that exact name, so a runtime built with
+COMPILER_RT_STATIC_INTERCEPTION is only usable together with the list of
+functions it intercepts.  Writing that list down by hand would put a
+second, silently drifting copy of "what does asan intercept" in the tree.
+
+Read it out of the built archive instead, the way the exported-symbol list
+is already produced: gen_wrap_list.py runs nm over libclang_rt.asan.a and
+writes one --wrap=<func> line per __wrap_ symbol it finds.  The result is
+installed next to the archive as libclang_rt.asan.a.wrap and is passed to
+a link as -Wl,@<path>.
+
+A name in the list with no __wrap_ definition behind it is a hard link
+error rather than a silently missing interceptor, so the two halves cannot
+drift apart unnoticed.
+
+The other direction needs care: wrapping a function no library in the link
+defines is worse than not wrapping it, because the call binds to the
+interceptor, whose weak __real_ reference is null, and jumps through it --
+where without the flag it would have been an undefined symbol error.  musl
+declares a few functions it never defines, pthread_mutexattr_getprioceiling
+among them, so this is reachable.  COMPILER_RT_STATIC_INTERCEPTION_LIBS
+names the libraries the link will provide and the list is intersected with
+the external symbols they define, which keeps it derived rather than
+curated and puts the link error back.
+
+It has no default.  An empty list means every interceptor is listed, which
+is the failure the option exists to prevent and the quiet one, so a build
+that turns interception on without saying what the link will provide stops
+at configure time.  For the same reason the generator refuses an
+intersection that keeps less than half of the interceptors: a libc defines
+nearly all of what a sanitizer intercepts, so a much smaller answer means
+the libraries named are not the ones the link will actually use, and the
+result would be a runtime with almost nothing attached and no error.
+
+The response file itself is not optional either.  Nothing in the runtime
+refers to a __wrap_ name -- the linker is what attaches them -- so a link
+that omits the file succeeds and produces a binary that is genuinely
+static, contains the runtime, is instrumented, and has every interceptor
+detached.  It does not silently run that way: the memintrinsic initializer
+checks that REAL(memcpy) is not null, so it aborts before main with
+
+  AddressSanitizer: CHECK failed: ... "((real_memcpy)) != (0)" (0x0, 0x0)
+      <empty stack>
+
+which is a real failure but a run-time one, found by whoever runs the
+program rather than by whoever linked it, and it names a null pointer
+rather than the missing list.  The first line of the file defines
+__asan_wrap_list_present and the runtime carries a reference to it, so the
+link fails instead, naming the symbol.
+---
+ compiler-rt/CMakeLists.txt                    |  17 +++
+ .../cmake/Modules/SanitizerUtils.cmake        |  54 ++++++++
+ compiler-rt/lib/asan/CMakeLists.txt           |   6 +
+ compiler-rt/lib/asan/asan_rtl.cpp             |  13 ++
+ .../sanitizer_common/scripts/gen_wrap_list.py | 121 ++++++++++++++++++
+ 5 files changed, 211 insertions(+)
+ create mode 100755 compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+
+diff --git a/compiler-rt/CMakeLists.txt b/compiler-rt/CMakeLists.txt
+index 89c2bc5b2..2f97cb07f 100644
+--- a/compiler-rt/CMakeLists.txt
++++ b/compiler-rt/CMakeLists.txt
+@@ -107,6 +107,23 @@ set(COMPILER_RT_HWASAN_WITH_INTERCEPTORS ${COMPILER_RT_HWASAN_WITH_INTERCEPTORS_
+ # listing them.
+ set(COMPILER_RT_STATIC_INTERCEPTION OFF CACHE BOOL "Attach interceptors at link time with ld --wrap instead of at run time with dlsym")
+ 
++# The libraries a link against that runtime will provide.  Only interceptors
++# whose function one of them defines end up in the response file, so that calling
++# something the libc merely declares stays an undefined symbol error rather than
++# a jump through a null __real_ pointer.  It has no default: listing every
++# interceptor is exactly the failure this exists to prevent, and it would be the
++# quiet one, so a build that does not say what the link will provide stops here.
++set(COMPILER_RT_STATIC_INTERCEPTION_LIBS "" CACHE STRING "Libraries a link against the statically intercepting runtime will provide")
++if (COMPILER_RT_STATIC_INTERCEPTION AND NOT COMPILER_RT_STATIC_INTERCEPTION_LIBS)
++  message(FATAL_ERROR
++    "COMPILER_RT_STATIC_INTERCEPTION needs COMPILER_RT_STATIC_INTERCEPTION_LIBS "
++    "set to the libraries a link against this runtime will provide, usually the "
++    "libc it is built against.  Without them every interceptor is listed, "
++    "including the ones for functions the libc only declares, and a call to one "
++    "of those binds to the interceptor and jumps through a null __real_ pointer "
++    "at run time instead of failing the link.")
++endif()
++
+ set(COMPILER_RT_BAREMETAL_BUILD OFF CACHE BOOL
+   "Build for a bare-metal target.")
+ 
+diff --git a/compiler-rt/cmake/Modules/SanitizerUtils.cmake b/compiler-rt/cmake/Modules/SanitizerUtils.cmake
+index dea4d9a21..76d056ec0 100644
+--- a/compiler-rt/cmake/Modules/SanitizerUtils.cmake
++++ b/compiler-rt/cmake/Modules/SanitizerUtils.cmake
+@@ -3,6 +3,9 @@ include(CompilerRTUtils)
+ set(SANITIZER_GEN_DYNAMIC_LIST
+   ${COMPILER_RT_SOURCE_DIR}/lib/sanitizer_common/scripts/gen_dynamic_list.py)
+ 
++set(SANITIZER_GEN_WRAP_LIST
++  ${COMPILER_RT_SOURCE_DIR}/lib/sanitizer_common/scripts/gen_wrap_list.py)
++
+ if(CMAKE_NM)
+   set(SANITIZER_NM "${CMAKE_NM}")
+ else()
+@@ -51,6 +54,57 @@ macro(add_sanitizer_rt_symbols name)
+   endforeach()
+ endmacro()
+ 
++# Create a target "<name>-<arch>-wrap-list" that generates the linker response
++# file a link against the static runtime "<name>" must pass when it was built
++# with COMPILER_RT_STATIC_INTERCEPTION.  It holds one --wrap=<func> per
++# interceptor found in the built archive, and is installed next to it as
++# <name>.a.wrap.
++# The libraries in COMPILER_RT_STATIC_INTERCEPTION_LIBS, if any, are the ones the
++# link will provide; an interceptor whose function none of them defines is left
++# out, so that calling it stays an undefined symbol error instead of becoming a
++# jump through a null __real_ pointer.
++#   add_sanitizer_rt_wrap_list(<name>
++#                              ARCHS <architectures>
++#                              PARENT_TARGET <convenience parent target>)
++macro(add_sanitizer_rt_wrap_list name)
++  cmake_parse_arguments(ARG
++    ""
++    "PARENT_TARGET"
++    "ARCHS"
++    ${ARGN})
++  foreach(arch ${ARG_ARCHS})
++    set(target_name ${name}-${arch})
++    # The output is $<TARGET_FILE:${target_name}>.wrap, but a target-dependent
++    # generator expression cannot be an OUTPUT, so the command is tracked by a
++    # stamp -- the same arrangement as add_sanitizer_rt_symbols above.
++    set(stamp ${CMAKE_CURRENT_BINARY_DIR}/${target_name}.wrap-stamp)
++    set(available_args)
++    foreach(lib ${COMPILER_RT_STATIC_INTERCEPTION_LIBS})
++      list(APPEND available_args "--available" ${lib})
++    endforeach()
++    add_custom_command(OUTPUT ${stamp}
++      COMMAND ${Python3_EXECUTABLE}
++        ${SANITIZER_GEN_WRAP_LIST} $<TARGET_FILE:${target_name}>
++        --nm-executable "${SANITIZER_NM}" ${available_args}
++        -o $<TARGET_FILE:${target_name}>.wrap
++      COMMAND ${CMAKE_COMMAND} -E touch ${stamp}
++      DEPENDS ${target_name} ${SANITIZER_GEN_WRAP_LIST}
++              ${COMPILER_RT_STATIC_INTERCEPTION_LIBS}
++      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
++      COMMENT "Generating wrap list for ${target_name}"
++      VERBATIM)
++    add_custom_target(${target_name}-wrap-list ALL
++      DEPENDS ${stamp}
++      SOURCES ${SANITIZER_GEN_WRAP_LIST})
++    get_compiler_rt_install_dir(${arch} install_dir)
++    install(FILES $<TARGET_FILE:${target_name}>.wrap
++            DESTINATION ${install_dir})
++    if(ARG_PARENT_TARGET)
++      add_dependencies(${ARG_PARENT_TARGET} ${target_name}-wrap-list)
++    endif()
++  endforeach()
++endmacro()
++
+ # This function is only used on Darwin, where undefined symbols must be specified
+ # in the linker invocation.
+ function(add_weak_symbols libname link_flags)
+diff --git a/compiler-rt/lib/asan/CMakeLists.txt b/compiler-rt/lib/asan/CMakeLists.txt
+index a8882cab1..99c2be83e 100644
+--- a/compiler-rt/lib/asan/CMakeLists.txt
++++ b/compiler-rt/lib/asan/CMakeLists.txt
+@@ -343,6 +343,12 @@ else()
+       add_dependencies(asan clang_rt.asan-${arch}-symbols)
+     endif()
+ 
++    if (COMPILER_RT_STATIC_INTERCEPTION)
++      add_sanitizer_rt_wrap_list(clang_rt.asan
++        ARCHS ${arch}
++        PARENT_TARGET asan)
++    endif()
++
+     if (WIN32)
+       set(DYNAMIC_RUNTIME_THUNK_CFLAGS "-DSANITIZER_DYNAMIC_RUNTIME_THUNK")
+ 
+diff --git a/compiler-rt/lib/asan/asan_rtl.cpp b/compiler-rt/lib/asan/asan_rtl.cpp
+index 19c6c210b..ffbd2e8f3 100644
+--- a/compiler-rt/lib/asan/asan_rtl.cpp
++++ b/compiler-rt/lib/asan/asan_rtl.cpp
+@@ -33,6 +33,19 @@
+ #include "ubsan/ubsan_init.h"
+ #include "ubsan/ubsan_platform.h"
+ 
++#if SANITIZER_STATIC_INTERCEPTION
++// The interceptors of a statically intercepting runtime are attached by the
++// link: they are named __wrap_<func> and are reached only if the link passes
++// --wrap=<func> for each of them, which it does with the response file installed
++// next to this archive.  Leaving the response file out is not a link error and
++// not a run-time error either -- the program contains the runtime, initializes
++// it, and is instrumented, with every interceptor detached and no diagnostic
++// anywhere.  The response file defines this symbol, so that leaving it out is an
++// undefined symbol at link time instead.
++extern "C" char __asan_wrap_list_present;
++static char *const kAsanWrapListPresent USED = &__asan_wrap_list_present;
++#endif
++
+ uptr __asan_shadow_memory_dynamic_address;  // Global interface symbol.
+ int __asan_option_detect_stack_use_after_return;  // Global interface symbol.
+ uptr *__asan_test_only_reported_buggy_pointer;  // Used only for testing asan.
+diff --git a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+new file mode 100755
+index 000000000..9fd0ebf47
+--- /dev/null
++++ b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python
++# ===- lib/sanitizer_common/scripts/gen_wrap_list.py -----------------------===#
++#
++# Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++# See https://llvm.org/LICENSE.txt for license information.
++# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++#
++# ===------------------------------------------------------------------------===#
++#
++# Generates the list of --wrap options a link against a static sanitizer runtime
++# built with COMPILER_RT_STATIC_INTERCEPTION has to pass.  In that mode every
++# interceptor is defined as __wrap_<func> and reaches the original function
++# through __real_<func>, both of which mean nothing to the linker unless
++# --wrap=<func> is passed for that exact name.  The list is read out of the
++# built archive rather than written down anywhere, so it cannot drift from the
++# interceptors that actually exist.
++#
++# --wrap=<func> on a function no library in the link defines is worse than not
++# wrapping it: the call binds to the interceptor, whose __real_<func> is a weak
++# undefined symbol, and jumps through a null pointer -- where without the flag it
++# would have been an undefined symbol error at link time.  So the libraries the
++# link will provide can be named with --available, and only the interceptors that
++# have something behind them are listed.
++#
++# The output format is a linker response file: one --wrap=<func> per line,
++# usable as -Wl,@<file>.  Its first line defines __asan_wrap_list_present, which
++# the runtime references: a link that leaves the response file out would
++# otherwise succeed and produce a program with every interceptor detached, since
++# nothing in it refers to a __wrap_ name.
++#
++# Usage:
++#   gen_wrap_list.py libclang_rt.asan.a --available libc.a -o libclang_rt.asan.a.wrap
++#
++# ===------------------------------------------------------------------------===#
++import argparse
++import subprocess
++import sys
++
++PREFIX = "__wrap_"
++
++# Defined by the response file and referenced by the runtime, so that a link
++# without the response file fails instead of detaching every interceptor.
++PRESENT_SYMBOL = "__asan_wrap_list_present"
++
++# A floor on how much of the runtime's interception survives intersecting it with
++# --available.  The libraries named there are meant to be the ones the link will
++# provide, and a libc defines nearly all of what a sanitizer intercepts; a
++# fraction far below this means the wrong libraries were named, which would
++# otherwise show up as a runtime with almost nothing intercepted and no error.
++MINIMUM_AVAILABLE_FRACTION = 0.5
++
++
++def defined_symbols(nm_executable, library):
++    """The names of the symbols library defines and a link can bind to."""
++    nm = subprocess.Popen(
++        [nm_executable, "--defined-only", "--extern-only", library],
++        stdout=subprocess.PIPE,
++        universal_newlines=True,
++    )
++    names = set()
++    for line in nm.stdout:
++        fields = line.split()
++        # "<address> <type> <name>", or "<type> <name>" for absolute symbols.
++        if len(fields) >= 2:
++            names.add(fields[-1])
++    if nm.wait() != 0:
++        raise RuntimeError("%s failed on %s" % (nm_executable, library))
++    return names
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("library", help="static sanitizer runtime to read")
++    parser.add_argument("-o", "--output", required=True, help="output file")
++    parser.add_argument("--nm-executable", required=True, help="path to nm")
++    parser.add_argument(
++        "--available",
++        action="append",
++        default=[],
++        metavar="LIBRARY",
++        help="a library the link will provide; given at least one, an "
++        "interceptor is listed only if one of them defines the function it "
++        "replaces",
++    )
++    args = parser.parse_args()
++
++    try:
++        names = set(
++            name[len(PREFIX) :]
++            for name in defined_symbols(args.nm_executable, args.library)
++            if name.startswith(PREFIX)
++        )
++        intercepted = len(names)
++        if args.available:
++            available = set()
++            for library in args.available:
++                available |= defined_symbols(args.nm_executable, library)
++            names &= available
++    except RuntimeError as e:
++        print(e, file=sys.stderr)
++        return 1
++    if not intercepted:
++        print("no %s symbols in %s" % (PREFIX, args.library), file=sys.stderr)
++        return 1
++    if len(names) < MINIMUM_AVAILABLE_FRACTION * intercepted:
++        print(
++            "only %d of %s's %d interceptors are defined by %s"
++            % (len(names), args.library, intercepted, ", ".join(args.available)),
++            file=sys.stderr,
++        )
++        return 1
++
++    with open(args.output, "w") as f:
++        f.write("--defsym=%s=1\n" % PRESENT_SYMBOL)
++        for name in sorted(names):
++            f.write("--wrap=%s\n" % name)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

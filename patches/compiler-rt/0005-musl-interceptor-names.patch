@@ -1,0 +1,80 @@
+From 3a5eee9fbcc9a43e503f8099afbe35637b536257 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 22:37:24 -0700
+Subject: [PATCH] [sanitizer_common] intercept the functions musl actually
+ defines
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Three interceptors are selected by asking a question about glibc, and get
+the wrong answer on musl.  All three fail quietly: the interceptor is
+built and linked, it just never runs.
+
+  * The stat family is gated on __GLIBC_PREREQ(2, 33), which is 0 off
+    glibc, so compiler-rt installs __xstat and __lxstat.  musl carries
+    those only as dead glibc 2.0 compatibility shims, so stat, lstat,
+    fstat and fstatat are not intercepted at all and an overflowing
+    struct stat buffer is never reported.
+
+  * strerror_r picks the GNU form unless _GNU_SOURCE is off -- and clang
+    predefines _GNU_SOURCE for C++ on a musl target, while the interceptor
+    translation units are C++.  musl only has the POSIX form, so the
+    interceptor reads an int return value as a pointer and its write range
+    check never runs.
+
+  * dn_comp and dn_expand are intercepted under glibc's __-prefixed names
+    below glibc 2.34.  musl has only ever had the plain names, and an
+    interceptor bound to a name the libc does not define is unreachable.
+
+Ask about musl where the answer differs.
+---
+ .../sanitizer_common/sanitizer_common_interceptors.inc    | 8 ++++++--
+ .../sanitizer_common/sanitizer_platform_interceptors.h    | 5 ++++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+index 69439f830..a91bd64e8 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+@@ -2566,8 +2566,9 @@ INTERCEPTOR(int, __b64_pton, char const *src, char *target, SIZE_T targsize) {
+ #endif  // SANITIZER_INTERCEPT___B64_TO
+ 
+ #if SANITIZER_INTERCEPT_DN_COMP_EXPAND
+-#  if __GLIBC_PREREQ(2, 34)
++#  if SANITIZER_MUSL || __GLIBC_PREREQ(2, 34)
+ // Changed with https://sourceware.org/git/?p=glibc.git;h=640bbdf
++// musl has only ever had the plain names.
+ #    define DN_COMP_INTERCEPTOR_NAME dn_comp
+ #    define DN_EXPAND_INTERCEPTOR_NAME dn_expand
+ #  else
+@@ -4057,9 +4058,12 @@ INTERCEPTOR(char *, strerror, int errnum) {
+ //    writes message to buf.
+ //  * GNU version returns message pointer, which points to either buf or some
+ //    static storage.
++// musl only ever has the POSIX form, whatever _GNU_SOURCE says -- and clang
++// predefines _GNU_SOURCE for C++ on a musl target, so the GNU branch would win
++// here and read an int return value as a pointer.
+ #if ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE) || \
+     SANITIZER_APPLE || SANITIZER_ANDROID || SANITIZER_NETBSD ||                 \
+-    SANITIZER_FREEBSD
++    SANITIZER_FREEBSD || SANITIZER_MUSL
+ // POSIX version. Spec is not clear on whether buf is NULL-terminated.
+ // At least on OSX, buf contents are valid even when the call fails.
+ INTERCEPTOR(int, strerror_r, int errnum, char *buf, SIZE_T buflen) {
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
+index febd233bb..2560c3feb 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
+@@ -499,7 +499,10 @@ SANITIZER_WEAK_IMPORT void *aligned_alloc(__sanitizer::usize __alignment,
+ #define SANITIZER_INTERCEPT_SEND_SENDTO SI_POSIX
+ #define SANITIZER_INTERCEPT_EVENTFD_READ_WRITE (SI_LINUX || SI_FREEBSD)
+ 
+-#define SI_STAT_LINUX (SI_LINUX && __GLIBC_PREREQ(2, 33))
++// glibc moved stat out of the __xstat compatibility layer in 2.33; musl never
++// had it, and defines __xstat only as a dead glibc 2.0 shim, so gating on the
++// glibc version alone leaves musl with interceptors nothing ever calls.
++#define SI_STAT_LINUX (SI_LINUX && (SANITIZER_MUSL || __GLIBC_PREREQ(2, 33)))
+ #define SANITIZER_INTERCEPT_STAT                                        \
+   (SI_FREEBSD || SI_MAC || SI_ANDROID || SI_NETBSD || SI_SOLARIS ||     \
+    SI_STAT_LINUX)

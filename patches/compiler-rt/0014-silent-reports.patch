@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Tue, 25 Aug 2026 19:55:43 +0000
+Subject: [PATCH] [compiler-rt] silent reports: a runtime that dies without
+ writing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Sealed init (patch 0012) made the runtime's start-up a function of the
+binary alone, and left the report path out on purpose: "a run that reports an
+error is not sealed and is not meant to be."  That is the right default and
+the wrong last word for one consumer.  An equivalence statement between a
+binary and its sanitized twin quantifies over all inputs, the inputs on which
+the sanitizer fires included, and on those a loud runtime writes a report the
+plain binary has no counterpart for -- so the write syscalls that carry it
+are a difference a syscall-level model has to either model or excuse.  What
+that consumer needs is a runtime that still detects, still dies, and dies
+with the same exit status, but writes nothing on the way down: the behaviour
+the same binary would have if stderr had been closed before it started, minus
+the failing write itself.
+
+Report text leaves the process through exactly two doors, and this patch puts
+the same test behind both.  ReportFile::Write is where everything Printf(),
+Report() and RawWrite() produce funnels -- the report body, verbosity output,
+statistics, the leak checker's summary -- and the test sits before the lock
+and before ReopenIfNecessary(), so a silent process never opens a log file
+either.  CatastrophicErrorWrite is the other door, the one CHECK failures and
+Die() use when the report file cannot be trusted, and it writes to kStderrFd
+directly.  Nothing else in the posix runtime writes report text: the other
+internal_write callers are the pipe probes (IsAccessibleMemoryRange,
+TryMemCpy), which write to their own pipes and are not reports.
+
+What is deliberately unchanged: detection, halt_on_error, Die(), the exit
+status, the death callback, and the program's own output -- this silences the
+runtime, not the process.  Also unchanged is the work of building the report:
+unwinding and symbolization still run and still cost their syscalls, so a
+caller who needs the error path to make no syscalls at all needs more than
+this.  The silence begins where the bytes would have left the process.
+
+The switch is the same mechanism as the seal and for the same reason
+(sanitizer_sealed.h): an undefined weak symbol the link may define,
+
+  -Wl,--defsym=__sanitizer_silent_reports=1
+
+so one runtime archive serves both modes, a silent binary and its loud
+control differ in one linker flag, and the two symbols compose -- a sealed
+silent binary is both defsyms on the same link.
+
+---
+ .../lib/sanitizer_common/sanitizer_file.cpp   |  6 ++
+ .../lib/sanitizer_common/sanitizer_posix.cpp  |  7 ++
+ .../lib/sanitizer_common/sanitizer_silent.h   | 92 +++++++++++++++++++
+ 3 files changed, 105 insertions(+)
+ create mode 100644 compiler-rt/lib/sanitizer_common/sanitizer_silent.h
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_file.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_file.cpp
+index 96af270..e35823e 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_file.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_file.cpp
+@@ -19,11 +19,17 @@
+ 
+ #include "sanitizer_common.h"
+ #include "sanitizer_file.h"
++#include "sanitizer_silent.h"
+ #  include "sanitizer_interface_internal.h"
+ 
+ namespace __sanitizer {
+ 
+ void CatastrophicErrorWrite(const char *buffer, uptr length) {
++  // The one path to stderr that does not go through ReportFile::Write:
++  // CHECK failures and Die() use this when the report file cannot be
++  // trusted.  Same test, same meaning; see sanitizer_silent.h.
++  if (SilentReports())
++    return;
+   WriteToFile(kStderrFd, buffer, length);
+ }
+ 
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
+index e80d495..b9fe40c 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
+@@ -22,6 +22,7 @@
+ #include "sanitizer_posix.h"
+ #include "sanitizer_procmaps.h"
+ #include "sanitizer_sealed.h"
++#include "sanitizer_silent.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -293,6 +294,12 @@ bool IsAbsolutePath(const char *path) {
+ }
+ 
+ void ReportFile::Write(const char *buffer, uptr length) {
++  // Everything Printf(), Report() and RawWrite() emit funnels through here,
++  // so this one test is most of what "silent" means; see sanitizer_silent.h.
++  // The return is before the lock and before ReopenIfNecessary(), so a
++  // silent process also never opens a log file.
++  if (SilentReports())
++    return;
+   SpinMutexLock l(mu);
+   ReopenIfNecessary();
+   internal_write(fd, buffer, length);
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_silent.h b/compiler-rt/lib/sanitizer_common/sanitizer_silent.h
+new file mode 100644
+index 0000000..6a1fd74
+--- /dev/null
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_silent.h
+@@ -0,0 +1,92 @@
++//===-- sanitizer_silent.h --------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Silent reports: a link-time mode in which the runtime writes nothing, to
++// stderr or anywhere else.  The process behaves as if stderr had been closed
++// before it started: an error is still detected, the process still dies, and
++// it dies with the same exit status it would have died with -- what is gone
++// is the bytes, and the write syscalls that would have carried them.
++//
++// It is off unless the link defines __sanitizer_silent_reports, so nothing
++// here changes what an ordinary build does.  What it changes when it is on:
++//
++//   - ReportFile::Write() returns before writing.  Everything Printf(),
++//     Report(), VReport() and RawWrite() produce -- the report body, the
++//     shadow legend, verbosity output, statistics, the leak checker's
++//     summary -- funnels through that one function, so one test there is
++//     what makes this total rather than a list of message kinds.  The
++//     return is also before ReopenIfNecessary(), so a silent process never
++//     opens a log file either: log_path names a file that is not created.
++//   - CatastrophicErrorWrite() returns before writing.  It is the one other
++//     path to stderr: CHECK failures and Die() use it when the report file
++//     cannot be trusted, and it writes to kStderrFd directly.
++//
++// What it does NOT change, on purpose:
++//
++//   - detection.  The checks run, the error is found, and halt_on_error
++//     still decides what happens next.  A silent binary is not a binary
++//     with the sanitizer weakened; it is one whose verdict arrives as an
++//     exit status instead of as text.
++//   - the exit status.  Die() runs exactly as before -- flags()->exitcode,
++//     abort_on_error, the death callback -- so a silent binary and a loud
++//     binary built from the same source leave the same corpse.  A checker
++//     that reads the exit status cannot tell them apart; only one that
++//     reads stderr can, which is the point.
++//   - the program's own output.  This silences the runtime, not the
++//     process: printf and fprintf(stderr, ...) in the program still write.
++//     "As if stderr were closed" describes the runtime's relationship to
++//     its report stream, not the file descriptor itself, which is left
++//     exactly as the program received it.
++//   - the work of building the report.  Unwinding, symbolization and the
++//     rest of the error path still run and still cost what they cost,
++//     syscalls included; the silence begins where the bytes would have
++//     left the process.  A caller who needs the error path to make no
++//     syscalls at all needs halt_on_error's earliest exit, not this.
++//
++// The switch is a symbol rather than a build option for the same reason
++// sealed init's is (sanitizer_sealed.h): one runtime archive serves both
++// modes, so a silent binary and its loud control can be built and compared
++// inside one image, differing in one linker flag:
++//
++//   -Wl,--defsym=__sanitizer_silent_reports=1
++//
++// and it composes with the seal the same way -- the two symbols are
++// independent, so any configuration can add either or both.
++//
++// Why anyone wants this.  An equivalence statement between a binary and its
++// sanitized twin quantifies over inputs, including the inputs on which the
++// sanitizer fires; on those, a loud runtime writes a report the plain binary
++// has no counterpart for, and the write syscalls that carry it are exactly
++// the difference a syscall-level model then has to excuse.  Silencing the
++// report makes the sanitized binary's failure mode what the statement needs
++// it to be: the same syscalls, then a different exit status.  The exit
++// status is the entire channel, and it is a channel the plain binary also
++// has.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef SANITIZER_SILENT_H
++#define SANITIZER_SILENT_H
++
++#include "sanitizer_internal_defs.h"
++
++extern "C" {
++// Defined by the link, as an absolute symbol, when silent reports are wanted,
++// and left as an undefined weak symbol, whose address is 0, when they are not.
++SANITIZER_WEAK_ATTRIBUTE extern char __sanitizer_silent_reports;
++}
++
++namespace __sanitizer {
++
++// Decided by the link and never changes afterwards, so this is a constant to
++// every caller and the branches below fold away in each run.
++inline bool SilentReports() { return &__sanitizer_silent_reports != nullptr; }
++
++}  // namespace __sanitizer
++
++#endif  // SANITIZER_SILENT_H
+-- 
+2.39.5
+

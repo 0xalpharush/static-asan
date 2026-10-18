@@ -1,0 +1,909 @@
+From 12fbfc0533f33b2c76e70b0ef61133f73acec2cc Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Wed, 19 Aug 2026 17:01:47 +0000
+Subject: [PATCH] [compiler-rt] sealed init: a start-up that reads nothing
+ outside the binary
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: A caller who reasons about one of these binaries formally has to quantify
+over what the process is handed -- every valid environment, every valid initial
+filesystem, every valid initial stack pointer -- and ASan's start-up reads all
+three.  Measured on a static riscv64 binary that does one write(2) and _exit(0),
+under qemu-riscv64-static -strace, a healthy run makes seventeen kinds of
+syscall.  Ten of them are read, write, openat, close, mmap, munmap, brk,
+readlinkat, set_tid_address and exit_group.  The other seven are
+
+  madvise (6)   newfstatat (5)   sigaltstack (4)   rt_sigaction (3)
+  prlimit64 (3) rt_sigprocmask (1) getpid (1)
+
+and on top of those it opens /proc/self/cmdline once, /proc/self/environ once
+and /proc/self/maps four times, all through syscalls in the first list.
+
+The /proc reads are the ones that matter most, and a syscall census does not
+show why.  ASan does not call getenv: on Linux, GetEnv() reads
+/proc/self/environ directly.  So ASAN_OPTIONS is read on every run, and
+ASAN_OPTIONS=verbosity=1 is a legal environment under which an instrumented
+binary writes to stderr where the uninstrumented one is silent -- an
+observable difference with nothing to do with memory safety.  /proc/self/maps
+is a file, and an initial filesystem in which it holds something else is a legal
+filesystem.
+
+This adds a mode in which none of that happens.  It is off unless the link asks
+for it, so nothing about an ordinary build changes:
+
+  clang --config=/opt/asan-static/asan-musl-sealed.cfg prog.c -o prog
+
+which is the ordinary static ASan link plus
+-Wl,--defsym=__sanitizer_sealed_init=1.  sanitizer_sealed.h holds the switch,
+the two riscv64 constants and the whole of the reasoning; what follows is what
+each site does with it.
+
+The environment is sealed at GetEnv(), not at its callers.  ASAN_OPTIONS,
+LSAN_OPTIONS, UBSAN_OPTIONS and ASAN_SYMBOLIZER_PATH all arrive there, so one
+branch covers every name the runtime reads today and every one added later,
+which is the only version of this that stays true.  Options then come from the
+compiled-in defaults and from __asan_default_options(), both of which are parts
+of the binary.  GetArgsAndEnv(), which is the /proc/self/cmdline and second
+/proc/self/environ read (musl has no __libc_stack_end, so the fallback arm is
+the only arm on this libc), hands back empty vectors.  CacheBinaryName() names
+the binary <sealed> instead of resolving /proc/self/exe and reading
+/proc/self/cmdline.
+
+Three /proc/self/maps reads go, one per caller.  AsanCheckIncompatibleRT()
+walks the maps looking for a libclang_rt.asan.so mapped alongside the static
+runtime; a binary this mode is for is statically linked with no PT_INTERP, so
+nothing mapped one before the program started and there is no loader in it to
+map one later.  MemoryRangeIsAvailable() asks whether the shadow collides with
+an existing mapping; sealed mode answers yes without looking, which is what
+ASan already assumes on every platform whose shadow offset is dynamic.
+GetThreadStackTopAndBottom() finds the main thread's stack by walking the maps
+for the segment containing a local, and reads getrlimit(RLIMIT_STACK) for how
+far down it may grow -- a /proc read and one of the three prlimit64 calls.
+Sealed mode uses a fixed 8MB window, which is Linux's default RLIMIT_STACK,
+ending at the frame __asan_init recorded on its way in, rounded up to a page.
+
+Both halves of that are load-bearing.  Not the frame that computes it: what the
+bound has to contain is a local of SetThreadStackAndTls, one of the callers of
+the function computing it and so at a higher address, which AsanThread checks
+with CHECK(AddrIsInStack(&local)).  Rounding the computing frame up to a page
+usually covers the callers in between and does not when that frame lands within
+a few hundred bytes below a page boundary -- so the seal would abort at start-up for some
+sizes of the environment and not others, which is exactly the kind of dependence
+this mode exists to remove.  And no further than a page: a bound past the top of
+the mapped stack is worse than a small one, because on riscv64 HighMem ends
+where the stack does, so shadow writes for an address above it would land
+outside the shadow and in somebody else's memory.  What stays outside the window
+is main's own frame, which sits beside __libc_start_main's rather than below it;
+that costs the "located in stack of thread T0" line of a report and nothing
+else, since a frame above this one is a frame that is still live and
+__asan_handle_no_return is about the ones below.
+
+Symbolizer::LateInitialize() is not called.  All it does early is what the
+first report would do anyway -- Symbolizer::GetOrInit() is on the report path
+too -- and doing it early costs a stat of every directory in PATH looking for
+llvm-symbolizer, which is a newfstatat and a look at the filesystem on a run
+that may never report anything.  (With the environment sealed there is no PATH,
+so what it actually stats is the relative name llvm-symbolizer, in whatever the
+working directory is: a filesystem read whose result an initial filesystem
+chooses.)  Deferred, it lands where the rest of symbolization already is.
+
+The rest are one line each.  internal_madvise() returns 0 without the syscall:
+every madvise this runtime issues is advice -- MADV_DONTNEED to give freed pages
+back, MADV_DONTDUMP and MADV_[NO]HUGEPAGE on the shadow -- so sealing the one
+place they are issued costs resident memory and nothing else.
+PlatformUnpoisonStacks(), which runs on the way out of every program that calls
+a noreturn function and is where the fourth sigaltstack comes from, returns
+false: no alternate stack was installed, so there is nothing to ask.
+CreateMainThread() gives the main thread the os_id 0 rather than a getpid().
+
+The signal handlers, the alternate signal stack and the core dumper are flags
+already, and sealed mode pins them -- handle_segv, handle_sigbus, handle_abort,
+handle_sigill, handle_sigtrap, handle_sigfpe, use_sigaltstack, disable_coredump
+-- after every other source of flag values, so the guarantee belongs to the link
+rather than to what the program remembered to ask for.  Two more are pinned for
+reasons of their own.  detect_leaks, because the leak check runs at exit, which
+is on every run and not only a failing one, and cannot be sealed at all:
+StopTheWorld clones a tracer and ptraces the process, and the scan walks
+/proc/self/maps.  A mode whose start-up is sealed and whose exit is not would be
+no mode at all.  And the three background-thread flags, off by default, because
+turning any of them on starts a thread before main.
+
+One more is pinned and it is the only one here that is not about start-up:
+allocator_release_to_os_interval_ms, to -1.  The primary allocator's
+MaybeReleaseToOS() reads MonotonicNanoTime(), a clock_gettime(CLOCK_MONOTONIC),
+once a size class has a page's worth of freed chunks -- so it appears on no
+syscall census taken from a program that allocates little, which is every census
+in this file.  Sealing start-up cannot reach it, because it is not start-up.
+Measured on riscv64/musl under qemu-riscv64-static -strace, 800 malloc/free pairs
+across varied size classes: 23 clock_gettime before, 0 after.
+
+One more pin is not a syscall a healthy run makes at all: abort_on_error, to 1.
+It is how a run that FOUND a bug dies.  A detection's report ends in Die(),
+which otherwise leaves by exit_group(exitcode) -- and an exit status is a
+channel the program itself also has, so a caller comparing this binary's
+syscalls against its plain twin's cannot tell that exit from one the program
+chose.  Abort() dies by SIGABRT, whose rt_sigprocmask and tkill nothing on a
+healthy run emits, so what killed the process is not a status the program
+could have returned, and a detection is unambiguous to every observer.  What
+is not sealed stays not sealed: the report itself still prints, the abort's
+own two syscalls are accepted, because a run that found a bug has already
+left the behaviour sealing is about -- what the pin changes is only the last
+event, from an exit the program could have made to a signal it could not.
+An unsealed binary is untouched; its Die() keeps the upstream default.
+Pinned in SealFlags(), after __asan_default_options() has been parsed, a
+program's hook cannot reset it; that ordering is load-bearing for a consumer
+whose hook pins allocator_may_return_null=1 and must not unpin this.
+
+A 32-bit target has the same shape of problem in a second place, and it is
+answered the same way.  GetKernelAreaSize(), which is how GetMaxUserVirtualAddress()
+finds the top of memory there, probes the running kernel: /proc/self/maps for a
+writable segment in the top gigabyte, then personality() and uname() for whether
+a 64-bit kernel is underneath.  Sealed mode answers with the gigabyte, which is
+the 3G/1G split every 32-bit Linux this targets uses and the one ASan's own
+32-bit mapping is written for, with HighMem ending at 0xbfffffff.  Measured on
+armv7: that is the last /proc read in a sealed run, and the personality and
+uname calls go with it.
+
+That leaves riscv64's shadow, which is not a flag and is the reason this is a
+patch rather than a configuration.  asan_mapping.h selects
+ASAN_SHADOW_OFFSET_DYNAMIC there, the offset comes from an mmap probe sized by
+GetMaxVirtualAddress(), and on riscv64 that function answers
+(1 << (msb(current frame) + 1)) - 1 -- because RISC-V has Sv39, Sv48 and Sv57
+and nothing tells a process which one it is under.  So the size of the shadow
+reservation is a function of the initial stack pointer, which is the variable a
+caller of this kind quantifies over: every proof would have to reason about a
+mapping the caller does not choose.  Sealed mode pins GetMaxVirtualAddress() to
+0x7fffffffffff and FindDynamicShadowStart() to 0x7fff8000, which is the Sv48
+layout: Linux/riscv64 puts STACK_TOP at DEFAULT_MAP_WINDOW = 1 <<
+(MMAP_VA_BITS - 1) and MMAP_VA_BITS saturates at 48, so the top user address is
+0x7fffffffffff on any kernel with VA_BITS >= 48, and the offset is the one
+asan_mapping.h already uses for every other 47-bit user address space,
+x86_64's included.
+
+Sv39 is the other plausible pin and it is the wrong one, which is worth saying
+because it is the tempting one: it is what much riscv64 hardware runs and it
+makes the reservation 4GB rather than 14TB.  But a caller reasoning about these
+binaries quantifies the initial stack pointer over the window a kernel can put
+it in, and on an Sv48 kernel every such address is above an Sv39 ceiling -- so
+an Sv39-sealed binary would take the diagnostic path on every admissible run.
+A seal that refuses every run it was built for is worse than no seal, and
+nothing in a census would have shown it: the census is of a run that starts.
+
+The emulated case is how the frame-derived answer is most easily seen, and it is
+also why the pin has to be this one: under qemu-user the guest stack sits at a
+host address, so on a 47-bit host GetMaxVirtualAddress() answers 0x7fffffffffff
+and the reservation is 16TB.  The pin makes that the constant rather than the
+measurement.
+
+Pinning has a cost, on both architectures that do it, and __asan_init now states
+it rather than letting it fail later: a process whose stack is above the top of
+memory the binary carries cannot be sanitized by that binary, because HighMem
+ends below the stack and a shadow write for a stack address lands past the end
+of the shadow.  On riscv64 that is a kernel with VA_BITS >= 48, which places the
+initial stack near 1<<47, and it is qemu-user without -R 0x4000000000; on a
+32-bit target it is a kernel whose user/kernel split is not 3G/1G.  The check is
+against the frame __asan_init runs on, and it names which case it is, rather
+than dying inside a CHECK in asan_poisoning.cpp that does not mention the
+address space or, past that, quietly writing over memory that is not shadow.
+
+What is deliberately not sealed is the path a report takes.  Symbolization, the
+report and everything after it may do whatever they do: a run that reports has
+already left the behaviour the caller reasons about, and giving that path a
+quiet mode would remove the signal rather than the syscall.  Sealing is about
+start-up and teardown, which happen on every input.
+---
+ compiler-rt/lib/asan/asan_flags.cpp                   |  76 ++++++++++++++++++++++++++++++
+ compiler-rt/lib/asan/asan_linux.cpp                   |  24 ++++++++++++++++++++++++
+ compiler-rt/lib/asan/asan_posix.cpp                   |   9 +++++++++
+ compiler-rt/lib/asan/asan_rtl.cpp                     |  80 +++++++++++++++++++++++++++---
+ compiler-rt/lib/asan/asan_thread.cpp                  |   6 +++++-
+ compiler-rt/lib/sanitizer_common/sanitizer_common.cpp |  18 ++++++++++++++++++
+ compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp  |  50 ++++++++++++++++++++++++++++++
+ .../sanitizer_linux_libcdep.cpp                       |  30 ++++++++++++++++++++++++++++++
+ compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp  |  13 +++++++++++++
+ compiler-rt/lib/sanitizer_common/sanitizer_sealed.h   | 156 ++++++++++++++++++++++++++++++
+ 10 files changed, 454 insertions(+), 8 deletions(-)
+ create mode 100644 compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+
+diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
+index 9cfb70b..bdaa5d8 100644
+--- a/compiler-rt/lib/asan/asan_flags.cpp
++++ b/compiler-rt/lib/asan/asan_flags.cpp
+@@ -20,6 +20,7 @@
+ #include "sanitizer_common/sanitizer_common.h"
+ #include "sanitizer_common/sanitizer_flag_parser.h"
+ #include "sanitizer_common/sanitizer_flags.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_win_interception.h"
+ #include "ubsan/ubsan_flags.h"
+ #include "ubsan/ubsan_platform.h"
+@@ -212,9 +213,84 @@ static void ProcessFlags() {
+   }
+ }
+ 
++// The flags sealed init decides, whatever anything else asked for.
++//
++// Each one is a syscall this mode exists to not make, and each is applied
++// after every other source of flag values -- the compile-time default, the
++// ASAN_DEFAULT_OPTIONS definition, __asan_default_options() -- so that the
++// guarantee is a property of the link and not of what the program remembered
++// to ask for.  A sealed binary that wants a signal handler does not want a
++// sealed binary.
++//
++// Eight of them are the syscalls: the six handle_* flags are the rt_sigaction
++// calls and the rt_sigprocmask musl makes around installing each handler,
++// use_sigaltstack is the sigaltstack pair, and disable_coredump is two of the
++// three prlimit64 calls (the third is a getrlimit(RLIMIT_STACK) that goes with
++// the /proc read it accompanies).
++//
++// detect_leaks is here for a different reason, and it is the one thing in this
++// mode that removes a capability rather than a syscall.  The leak check runs at
++// exit, which is to say on every run and not only on a failing one, and it
++// cannot be sealed at all: StopTheWorld clones a tracer and ptraces the
++// process, and the scan walks /proc/self/maps for its root regions.  Leaving
++// it on would mean a mode whose start-up is sealed and whose exit is not.
++//
++// The three background-thread flags are off by default; they are pinned
++// because turning any of them on starts a thread, which is a clone, before
++// main.
++//
++// allocator_release_to_os_interval_ms is the ninth syscall, and unlike the
++// eight above it is not an init-time one -- which is why sealing start-up did
++// not remove it, and why it stayed unnoticed until a workload allocated enough
++// to trip it.  The primary allocator's MaybeReleaseToOS() reads
++// MonotonicNanoTime(), a clock_gettime(CLOCK_MONOTONIC), once a size class has
++// a page's worth of freed chunks.  A negative interval turns the heuristic off
++// and both automatic call sites are guarded by it -- see
++// sanitizer_allocator_primary64.h, `if (ReleaseToOSIntervalMs() >= 0)` before
++// the postponement stamp and `if (interval_ms < 0) return;` before the release
++// itself.  What is left is the force path behind __sanitizer_purge_allocator(),
++// which is an explicit call a program either makes or does not.
++//
++// abort_on_error is the last, and it is not a syscall a healthy run makes: it
++// is how a run that FOUND a bug dies.  Die() otherwise leaves by
++// exit_group(exitcode), and an exit status is a channel the program also has
++// -- a caller comparing this binary's syscalls against its plain twin's
++// cannot tell that exit from one the program chose.  Abort() dies by SIGABRT,
++// whose rt_sigprocmask + tkill nothing on a healthy run emits, so a
++// detection is unambiguous to every observer.  The report itself still
++// prints and the abort's own two syscalls are accepted: a run that found a
++// bug has already left the behaviour sealing is about, and what this pin
++// changes is only the last event, from an exit the program could have made
++// to a signal it could not.  Pinned here, after __asan_default_options()
++// has been parsed, a program's hook cannot reset it; that ordering is
++// load-bearing for a consumer whose hook pins allocator_may_return_null=1
++// and must not unpin this.
++static void SealFlags() {
++  if (!SealedInit())
++    return;
++  CommonFlags cf;
++  cf.CopyFrom(*common_flags());
++  cf.handle_segv = kHandleSignalNo;
++  cf.handle_sigbus = kHandleSignalNo;
++  cf.handle_abort = kHandleSignalNo;
++  cf.handle_sigill = kHandleSignalNo;
++  cf.handle_sigtrap = kHandleSignalNo;
++  cf.handle_sigfpe = kHandleSignalNo;
++  cf.use_sigaltstack = false;
++  cf.disable_coredump = false;
++  cf.detect_leaks = false;
++  cf.hard_rss_limit_mb = 0;
++  cf.soft_rss_limit_mb = 0;
++  cf.heap_profile = false;
++  cf.allocator_release_to_os_interval_ms = -1;
++  cf.abort_on_error = true;
++  OverrideCommonFlags(cf);
++}
++
+ void InitializeFlags() {
+   InitializeDefaultFlags();
+   ProcessFlags();
++  SealFlags();
+ 
+ #if SANITIZER_WINDOWS
+   // On Windows, weak symbols are emulated by having the user program
+diff --git a/compiler-rt/lib/asan/asan_linux.cpp b/compiler-rt/lib/asan/asan_linux.cpp
+index 4cabca3..d2a6418 100644
+--- a/compiler-rt/lib/asan/asan_linux.cpp
++++ b/compiler-rt/lib/asan/asan_linux.cpp
+@@ -36,6 +36,7 @@
+ #  include "sanitizer_common/sanitizer_hash.h"
+ #  include "sanitizer_common/sanitizer_libc.h"
+ #  include "sanitizer_common/sanitizer_procmaps.h"
++#  include "sanitizer_common/sanitizer_sealed.h"
+ 
+ #  if SANITIZER_FREEBSD
+ #    include <sys/link_elf.h>
+@@ -86,6 +87,19 @@ uptr FindPremappedShadowStart(uptr shadow_size_bytes) {
+ #  endif
+ 
+ uptr FindDynamicShadowStart() {
++#  if SANITIZER_RISCV64
++  // riscv64 is the only architecture this is reached on here, and this is the
++  // second half of pinning its mapping: the probe below asks the kernel for
++  // somewhere to put a shadow whose size came from GetMaxVirtualAddress(), so
++  // both the size and the address are facts about the run rather than about
++  // the binary.  Sealed mode names the offset instead.  It is the offset
++  // asan_mapping.h documents for a 47-bit user address space, x86_64's
++  // included, and it agrees with the kSealedMaxUserVirtualAddress that
++  // GetMaxVirtualAddress() has already returned: the shadow of everything
++  // below 0x7fffffffffff, placed at 0x7fff8000, ends at 0x10007fff7fff.
++  if (SealedInit())
++    return kSealedShadowOffset;
++#  endif
+   uptr shadow_size_bytes = MemToShadowSize(kHighMemEnd);
+ #  if ASAN_PREMAP_SHADOW
+   if (!PremapShadowFailed())
+@@ -182,6 +196,16 @@ void AsanCheckIncompatibleRT() {
+       // as early as possible, otherwise ASan interceptors could bind to
+       // the functions in dynamic ASan runtime instead of the functions in
+       // system libraries, causing crashes later in ASan initialization.
++      //
++      // Sealed mode skips the walk, which is a /proc/self/maps read.  What it
++      // looks for is a libclang_rt.asan.so mapped alongside the static runtime,
++      // and a binary this mode is built for is statically linked with no
++      // PT_INTERP: nothing mapped one before the program started and there is
++      // no loader in it to map one later.
++      if (SealedInit()) {
++        __asan_rt_version = ASAN_RT_VERSION_STATIC;
++        return;
++      }
+       MemoryMappingLayout proc_maps(/*cache_enabled*/ true);
+       char filename[PATH_MAX];
+       MemoryMappedSegment segment(filename, sizeof(filename));
+diff --git a/compiler-rt/lib/asan/asan_posix.cpp b/compiler-rt/lib/asan/asan_posix.cpp
+index 3968569..f4bb2c3 100644
+--- a/compiler-rt/lib/asan/asan_posix.cpp
++++ b/compiler-rt/lib/asan/asan_posix.cpp
+@@ -31,6 +31,7 @@
+ #  include "sanitizer_common/sanitizer_libc.h"
+ #  include "sanitizer_common/sanitizer_posix.h"
+ #  include "sanitizer_common/sanitizer_procmaps.h"
++#  include "sanitizer_common/sanitizer_sealed.h"
+ 
+ namespace __asan {
+ 
+@@ -41,6 +42,14 @@ void AsanOnDeadlySignal(int signo, void *siginfo, void *context) {
+ }
+ 
+ bool PlatformUnpoisonStacks() {
++  // This runs on the way out of every program that calls a noreturn function,
++  // _exit() included, so it is start-up's counterpart and is sealed for the
++  // same reason.  There is nothing to ask about: sealed init pins
++  // use_sigaltstack to false, so no alternate stack was ever installed, and
++  // returning false is how this reports "the default stack is the one we are
++  // on", which is what the caller then unpoisons.
++  if (SealedInit())
++    return false;
+   stack_t signal_stack;
+   CHECK_EQ(0, sigaltstack(nullptr, &signal_stack));
+   uptr sigalt_bottom = (uptr)signal_stack.ss_sp;
+diff --git a/compiler-rt/lib/asan/asan_rtl.cpp b/compiler-rt/lib/asan/asan_rtl.cpp
+index ffbd2e8..9e06a1a 100644
+--- a/compiler-rt/lib/asan/asan_rtl.cpp
++++ b/compiler-rt/lib/asan/asan_rtl.cpp
+@@ -29,6 +29,7 @@
+ #include "sanitizer_common/sanitizer_flags.h"
+ #include "sanitizer_common/sanitizer_interface_internal.h"
+ #include "sanitizer_common/sanitizer_libc.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_symbolizer.h"
+ #include "ubsan/ubsan_init.h"
+ #include "ubsan/ubsan_platform.h"
+@@ -336,6 +337,50 @@ static void asan_atexit() {
+   }
+ }
+ 
++// Sealed init writes the top of memory into the binary rather than measuring it
++// -- the Sv48 layout on riscv64, the 3G/1G split on a 32-bit target -- and a
++// process that was given more than that cannot be sanitized by this binary at
++// all: HighMem ends below the stack, so AddrIsInMem is false for every stack
++// address and a shadow write for one lands past the end of the shadow, in
++// somebody else's memory.
++//
++// So it is checked, once, against the only address known here to be in the
++// stack.  The alternative is not a crash at this point but a much later one: an
++// ASan CHECK inside asan_poisoning.cpp that does not mention the address space,
++// or, past that, memory quietly overwritten.
++//
++// The message is written with Printf and the exit is internal__exit, rather than
++// Report and Die, and that is deliberate rather than tidiness.  Report prefixes
++// "==pid==", which is a getpid; Die runs the die callbacks, and one of them
++// dumps the process map, which is a /proc read.  A failure this mode can produce
++// should stay inside the syscalls it promises even though it is a failure --
++// the caller reasoning about these binaries is quantifying over the runs that
++// reach it, and a diagnostic that leaves the modeled set makes those runs
++// unanalysable rather than merely failed.
++static void CheckSealedAddressSpace() {
++  if (!SealedInit())
++    return;
++  uptr frame;
++  uptr sp = reinterpret_cast<uptr>(&frame);
++  if (sp <= kHighMemEnd)
++    return;
++  Printf(
++      "AddressSanitizer: sealed init puts the top of memory at %p, and this "
++      "process's stack is at %p, which is above it.\n",
++      (void *)kHighMemEnd, (void *)sp);
++#if SANITIZER_RISCV64
++  Printf(
++      "A sealed riscv64 binary carries the Sv48 layout, whose stack top is "
++      "0x800000000000.  A kernel running Sv39 puts it at 0x4000000000 instead, "
++      "and this binary cannot run there.\n");
++#else
++  Printf(
++      "A sealed binary carries the top of memory its architecture's default "
++      "mapping has, and this kernel gives a process more than that.\n");
++#endif
++  internal__exit(common_flags()->exitcode);
++}
++
+ static void InitializeHighMemEnd() {
+ #if !ASAN_FIXED_MAPPING
+   kHighMemEnd = GetMaxUserVirtualAddress();
+@@ -408,12 +453,23 @@ static bool AsanInitInternal() {
+     return true;
+   SanitizerToolName = "AddressSanitizer";
+ 
++  // Sealed init describes the main thread's stack rather than reading
++  // /proc/self/maps for it, and this is the frame it describes it from.  Taken
++  // here, before anything else, because everything that will be compared
++  // against the answer runs below this point.  It is a store of a constant in
++  // an unsealed run.
++  uptr init_frame;
++  SealedSetInitFrame(reinterpret_cast<uptr>(&init_frame));
++
+   CacheBinaryName();
+ 
+   // Initialize flags. This must be done early, because most of the
+   // initialization steps look at flags().
+   InitializeFlags();
+ 
++  if (SealedInit())
++    VReport(1, "AddressSanitizer: sealed init\n");
++
+   WaitForDebugger(flags()->sleep_before_init, "before init");
+ 
+   // Stop performing init at this point if we are being loaded via
+@@ -435,6 +491,7 @@ static bool AsanInitInternal() {
+   InitializePlatformExceptionHandlers();
+ 
+   InitializeHighMemEnd();
++  CheckSealedAddressSpace();
+ 
+   // Install tool-specific callbacks in sanitizer_common.
+   AddDieCallback(AsanDie);
+@@ -510,13 +567,22 @@ static bool AsanInitInternal() {
+ 
+   InitializeSuppressions();
+ 
+-  if (CAN_SANITIZE_LEAKS) {
+-    // LateInitialize() calls dlsym, which can allocate an error string buffer
+-    // in the TLS.  Let's ignore the allocation to avoid reporting a leak.
+-    __lsan::ScopedInterceptorDisabler disabler;
+-    Symbolizer::LateInitialize();
+-  } else {
+-    Symbolizer::LateInitialize();
++  // Sealed mode does not choose a symbolizer here.  All this call does early is
++  // what the first report would do anyway -- Symbolizer::GetOrInit() is on the
++  // report path too -- and doing it early costs a stat of every directory in
++  // PATH looking for llvm-symbolizer, which is a newfstatat and a look at the
++  // filesystem, on a run that may never report anything.  Deferred, it lands
++  // where the rest of symbolization already is: outside the seal, because a run
++  // that reports has left the behaviour sealing is about.
++  if (!SealedInit()) {
++    if (CAN_SANITIZE_LEAKS) {
++      // LateInitialize() calls dlsym, which can allocate an error string buffer
++      // in the TLS.  Let's ignore the allocation to avoid reporting a leak.
++      __lsan::ScopedInterceptorDisabler disabler;
++      Symbolizer::LateInitialize();
++    } else {
++      Symbolizer::LateInitialize();
++    }
+   }
+ 
+   VReport(1, "AddressSanitizer Init done\n");
+diff --git a/compiler-rt/lib/asan/asan_thread.cpp b/compiler-rt/lib/asan/asan_thread.cpp
+index 37fb6f2..dea13d9 100644
+--- a/compiler-rt/lib/asan/asan_thread.cpp
++++ b/compiler-rt/lib/asan/asan_thread.cpp
+@@ -20,6 +20,7 @@
+ #include "lsan/lsan_common.h"
+ #include "sanitizer_common/sanitizer_common.h"
+ #include "sanitizer_common/sanitizer_placement_new.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_stackdepot.h"
+ #include "sanitizer_common/sanitizer_thread_history.h"
+ #include "sanitizer_common/sanitizer_tls_get_addr.h"
+@@ -295,7 +296,10 @@ AsanThread *CreateMainThread() {
+       /* parent_tid */ kMainTid,
+       /* stack */ nullptr, /* detached */ true);
+   SetCurrentThread(main_thread);
+-  main_thread->ThreadStart(internal_getpid());
++  // The os_id is what a report looks a thread up by and what lsan matches its
++  // stopped threads against.  Sealed mode has no leak checker and one thread
++  // here, and asking for the id is a getpid, so the main thread is given 0.
++  main_thread->ThreadStart(SealedInit() ? 0 : internal_getpid());
+   return main_thread;
+ }
+ 
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
+index 6cd69a5..c908066 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common.cpp
+@@ -19,11 +19,16 @@
+ #include "sanitizer_interface_internal.h"
+ #include "sanitizer_libc.h"
+ #include "sanitizer_placement_new.h"
++#include "sanitizer_sealed.h"
+ 
+ namespace __sanitizer {
+ 
+ const char *SanitizerToolName = "SanitizerTool";
+ 
++uptr sealed_init_frame;
++
++void SealedSetInitFrame(uptr frame) { sealed_init_frame = frame; }
++
+ atomic_uint32_t current_verbosity;
+ uptr PageSizeCached;
+ u32 NumberOfCPUsCached;
+@@ -294,6 +299,19 @@ void UpdateProcessName() {
+ void CacheBinaryName() {
+   if (binary_name_cache_str[0] != '\0')
+     return;
++  // Both halves of this reach outside the process image: ReadBinaryName
++  // resolves /proc/self/exe and ReadProcessName reads /proc/self/cmdline.  What
++  // they produce is the name a report prints and the path the symbolizer would
++  // open, so sealed mode names the binary rather than asking the kernel what it
++  // is called.  A caller that needs the real name in a sealed binary has it
++  // already: it is the file it just linked.
++  if (SealedInit()) {
++    internal_strncpy(binary_name_cache_str, "<sealed>",
++                     sizeof(binary_name_cache_str) - 1);
++    internal_strncpy(process_name_cache_str, "<sealed>",
++                     sizeof(process_name_cache_str) - 1);
++    return;
++  }
+   ReadBinaryName(binary_name_cache_str, sizeof(binary_name_cache_str));
+   ReadProcessName(process_name_cache_str, sizeof(process_name_cache_str));
+ }
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+index a6226e6..fcd8c29 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+@@ -25,6 +25,7 @@
+ #  include "sanitizer_mutex.h"
+ #  include "sanitizer_placement_new.h"
+ #  include "sanitizer_procmaps.h"
++#  include "sanitizer_sealed.h"
+ 
+ #  if SANITIZER_LINUX && !SANITIZER_GO
+ #    include <asm/param.h>
+@@ -281,6 +282,13 @@ int internal_mprotect(void *addr, uptr length, int prot) {
+ }
+ 
+ int internal_madvise(uptr addr, uptr length, int advice) {
++  // Every advice this runtime gives is advice: MADV_DONTNEED to hand freed
++  // pages back, MADV_DONTDUMP and MADV_[NO]HUGEPAGE on the shadow.  Dropping
++  // them costs resident memory the allocator would have released and changes
++  // nothing else, so sealed mode drops all of them at the one place they are
++  // issued rather than at each caller.
++  if (SealedInit())
++    return 0;
+   return internal_syscall(SYSCALL(madvise), addr, length, advice);
+ }
+ 
+@@ -717,6 +725,12 @@ const char *GetEnv(const char *name) {
+   }
+   return 0;  // Not found.
+ #  elif SANITIZER_LINUX
++  // Sealed mode reads no environment at all, and this is where that is made
++  // true: every ASAN_OPTIONS, LSAN_OPTIONS, UBSAN_OPTIONS and
++  // ASAN_SYMBOLIZER_PATH lookup in the runtime arrives here, so one branch
++  // covers all of them and any that are added later.
++  if (SealedInit())
++    return nullptr;
+   static char *environ;
+   static uptr len;
+   static bool inited;
+@@ -778,6 +792,19 @@ static void ReadNullSepFileToArray(const char *path, char ***arr,
+ #  endif
+ 
+ static void GetArgsAndEnv(char ***argv, char ***envp) {
++  // On a musl target the branch below always takes the /proc arm: reading argv
++  // and envp off the initial stack needs __libc_stack_end, which is a glibc
++  // symbol, so the weak reference to it is null and the fallback reads
++  // /proc/self/cmdline and /proc/self/environ.  Sealed mode reads neither, and
++  // hands back the empty vectors instead: what the runtime does with these is
++  // print a command line in a report and pass them to execve on a path
++  // (ReExec) that no Linux build takes.
++  static char *empty[] = {nullptr};
++  if (SealedInit()) {
++    *argv = empty;
++    *envp = empty;
++    return;
++  }
+ #  if SANITIZER_FREEBSD
+   // On FreeBSD, retrieving the argument and environment arrays is done via the
+   // kern.ps_strings sysctl, which returns a pointer to a structure containing
+@@ -1190,6 +1217,21 @@ static uptr GetKernelAreaSize() {
+ #    if SANITIZER_LINUX && !SANITIZER_X32
+   const uptr gbyte = 1UL << 30;
+ 
++  // This is the 32-bit half of the same problem riscv64 has, and it is answered
++  // the same way: what follows probes the running kernel -- /proc/self/maps for
++  // a writable segment in the top gigabyte, then personality() and uname() for
++  // whether a 64-bit kernel is underneath -- so on a 32-bit target the top of
++  // memory, and with it the size of the shadow, is a fact about the kernel
++  // rather than about the binary.  Sealed mode answers with the gigabyte, which
++  // is the 3G/1G split every 32-bit Linux this toolchain targets uses and the
++  // one ASan's own 32-bit mapping is written for: HighMem ends at 0xbfffffff.
++  //
++  // A kernel that gives a process more than that is refused rather than
++  // mismapped: __asan_init checks that the stack is inside HighMem and says so
++  // if it is not, which is the same check the riscv64 pin needs.
++  if (SealedInit())
++    return gbyte;
++
+   // Firstly check if there are writable segments
+   // mapped to top gigabyte (e.g. stack).
+   MemoryMappingLayout proc_maps(/*cache_enabled*/ true);
+@@ -1222,6 +1264,14 @@ static uptr GetKernelAreaSize() {
+ #  endif  // SANITIZER_WORDSIZE == 32
+ 
+ uptr GetMaxVirtualAddress() {
++#  if SANITIZER_RISCV64
++  // The answer below is read off the address of the current frame, which makes
++  // the size of ASan's shadow reservation a function of the initial stack
++  // pointer.  Sealed mode answers with the Sv48 constant instead; see
++  // sanitizer_sealed.h for which constant and why that one.
++  if (SealedInit())
++    return kSealedMaxUserVirtualAddress;
++#  endif
+ #  if SANITIZER_NETBSD && defined(__x86_64__)
+   return 0x7f7ffffff000ULL;  // (0x00007f8000000000 - PAGE_SIZE)
+ #  elif SANITIZER_WORDSIZE == 64
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+index 7ac2790..794fbf1 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+@@ -26,6 +26,7 @@
+ #  include "sanitizer_linux.h"
+ #  include "sanitizer_placement_new.h"
+ #  include "sanitizer_procmaps.h"
++#  include "sanitizer_sealed.h"
+ #  include "sanitizer_solaris.h"
+ 
+ #  if SANITIZER_NETBSD
+@@ -123,6 +124,35 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+   CHECK(stack_bottom);
+   if (at_initialization) {
+     // This is the main thread. Libpthread may not be initialized yet.
++    if (SealedInit()) {
++      // Both halves of what follows are sealed away: the getrlimit is a
++      // prlimit64 and the segment walk is a /proc/self/maps read.  What sealed
++      // mode uses instead is a fixed window ending at this frame -- see
++      // kSealedMainStackSize.
++      //
++      // The top is the frame initialization started on, rounded up to a page
++      // and no further.  Not this frame: a caller of this one, further up the
++      // stack, is checked against the bound computed here (see
++      // sealed_init_frame and the CHECK in AsanThread::SetThreadStackAndTls).  And no further, because that keeps it inside the stack the
++      // kernel mapped, which matters: a bound past the top of memory would
++      // send UnpoisonStack's shadow writes outside the shadow, and on riscv64,
++      // where HighMem ends where the stack does, outside means into somebody
++      // else's memory.
++      //
++      // What that leaves outside the window is main's own frame, which sits
++      // beside __libc_start_main's rather than below it.  Nothing is
++      // unpoisoned wrongly by that -- a frame above this one is a frame that is
++      // still live, and __asan_handle_no_return is about the ones below -- so
++      // what it can cost is the "located in stack of thread T0" line of a
++      // report, not whether the report happens.
++      uptr frame;
++      uptr here = sealed_init_frame ? sealed_init_frame
++                                    : reinterpret_cast<uptr>(&frame);
++      uptr top = RoundUpTo(here, GetPageSizeCached());
++      *stack_top = top;
++      *stack_bottom = top - kSealedMainStackSize;
++      return;
++    }
+     struct rlimit rl;
+     CHECK_EQ(getrlimit(RLIMIT_STACK, &rl), 0);
+ 
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
+index 69af646..e80d495 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp
+@@ -21,6 +21,7 @@
+ #include "sanitizer_libc.h"
+ #include "sanitizer_posix.h"
+ #include "sanitizer_procmaps.h"
++#include "sanitizer_sealed.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -237,6 +238,18 @@ static inline bool IntervalsAreSeparate(uptr start1, uptr end1,
+ // several worker threads on Mac, which aren't expected to map big chunks of
+ // memory).
+ bool MemoryRangeIsAvailable(uptr range_start, uptr range_end) {
++  // Answering this reads /proc/self/maps, and the one caller that reaches it
++  // at start-up is InitializeShadowMemory deciding whether the shadow it is
++  // about to reserve collides with something.  Sealed mode says yes without
++  // looking, which is what ASan already assumes on every platform whose shadow
++  // offset is dynamic (there the address came from an mmap probe, so it is
++  // available by construction).  Where the offset is a constant the assumption
++  // is the same one the constant embodies: the shadow of a static binary goes
++  // where the mapping was designed for it to go.  If it did not, the MAP_FIXED
++  // reservation that follows would take the range anyway; what is lost is the
++  // diagnostic, which is a report-path concern.
++  if (SealedInit())
++    return true;
+   MemoryMappingLayout proc_maps(/*cache_enabled*/true);
+   if (proc_maps.Error())
+     return true; // and hope for the best
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+new file mode 100644
+index 0000000..77858ae
+--- /dev/null
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+@@ -0,0 +1,156 @@
++//===-- sanitizer_sealed.h --------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Sealed init: a link-time mode in which everything the runtime does before
++// the program's first instruction, and everything it does on the way out, is
++// a function of the binary alone.
++//
++// It is off unless the link defines __sanitizer_sealed_init, so nothing here
++// changes what an ordinary build does.  What it changes when it is on:
++//
++//   - no environment is read, by any mechanism.  Not getenv, and not
++//     /proc/self/environ, which is where GetEnv() reads it from on Linux.
++//     ASAN_OPTIONS, LSAN_OPTIONS, UBSAN_OPTIONS and ASAN_SYMBOLIZER_PATH all
++//     go through GetEnv(), so sealing that one function is what makes this
++//     total rather than a list of names.  Options come from the compiled-in
++//     defaults and from __asan_default_options(), which is part of the binary.
++//   - no /proc is read: not environ, not cmdline, not maps, and /proc/self/exe
++//     is not resolved either.
++//   - no signal handler is installed and no alternate signal stack is set up,
++//     so no rt_sigaction, sigaltstack or rt_sigprocmask.
++//   - no madvise, so the allocator does not return pages to the OS and the
++//     shadow is neither MADV_DONTDUMP nor MADV_NOHUGEPAGE.
++//   - no prlimit64: the core dumper is left alone and RLIMIT_STACK is not read.
++//   - no getpid.
++//   - a detection dies by SIGABRT rather than by exit_group: abort_on_error
++//     is pinned to 1 (SealFlags, asan_flags.cpp), so a run that found a bug
++//     is killed by a signal the program could not have chosen as an exit
++//     status, where an exit_group(exitcode) is an event its plain twin could
++//     also have made.
++//   - on riscv64, the shadow offset and the size of the shadow reservation are
++//     constants rather than being derived from the address of the current
++//     frame, and the constants are the Sv48 layout's.  See
++//     kSealedMaxUserVirtualAddress below.
++//
++// What remains at start-up is mmap, munmap, mprotect and the program's own
++// syscalls.  A run that reports an error is not sealed and is not meant to be:
++// symbolization and the report itself do what they always did, except for the
++// last event -- abort_on_error is pinned, so the death under a report is a
++// SIGABRT rather than an exit status the program could also have produced.
++// The property this mode is for is a property of a run that does not
++// report anything, which is every run of a correct program.
++//
++// Why anyone wants this.  A caller who reasons about a binary formally has to
++// quantify over the things the process starts with -- the environment, the
++// filesystem, the initial stack pointer -- and a runtime that reads any of
++// them makes its own behaviour a function of a universally quantified
++// variable.  ASAN_OPTIONS=verbosity=1 is a legal environment, and under it an
++// instrumented binary writes to stderr where the uninstrumented one is silent;
++// that is a difference in observable behaviour that has nothing to do with
++// memory safety.  /proc/self/maps is a file, and an initial filesystem in
++// which it holds something else is a legal filesystem.  Sealing is what makes
++// those quantifiers survivable, and it is why the seal has to be complete
++// rather than merely quiet: a single GetEnv() left standing is a run whose
++// output the environment decides.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef SANITIZER_SEALED_H
++#define SANITIZER_SEALED_H
++
++#include "sanitizer_internal_defs.h"
++#include "sanitizer_platform.h"
++
++extern "C" {
++// Defined by the link, as an absolute symbol, when sealed init is wanted:
++//
++//   -Wl,--defsym=__sanitizer_sealed_init=1
++//
++// and left as an undefined weak symbol, whose address is 0, when it is not.
++// The switch is a symbol rather than a build option so that one runtime
++// archive serves both modes: a second build of compiler-rt would have to be
++// installed, selected and kept in step with the first, and the two would
++// differ in a way no test could compare within a single image.  It is a link
++// flag rather than a run-time flag because a run-time flag would have to be
++// read from somewhere, and the environment is exactly what this mode is for
++// not reading.
++SANITIZER_WEAK_ATTRIBUTE extern char __sanitizer_sealed_init;
++}
++
++namespace __sanitizer {
++
++// Sealed init is decided by the link and never changes afterwards, so this is
++// a constant to every caller and the branches below fold away in each run.
++inline bool SealedInit() { return &__sanitizer_sealed_init != nullptr; }
++
++#if SANITIZER_RISCV64
++// riscv64 is the one architecture here whose shadow offset is not a constant:
++// asan_mapping.h selects ASAN_SHADOW_OFFSET_DYNAMIC for it, the offset comes
++// out of an mmap probe sized by GetMaxVirtualAddress(), and that function
++// answers `(1 << (msb(current frame) + 1)) - 1` because RISC-V has three
++// address space layouts (Sv39, Sv48, Sv57) and nothing tells a process which
++// one it is running under.  So the size of the shadow reservation is a
++// function of the initial stack pointer.
++//
++// Sealed mode pins both to the Sv48 layout, which is the one Linux/riscv64
++// gives a process on any kernel with VA_BITS >= 48: STACK_TOP is
++// DEFAULT_MAP_WINDOW = 1 << (MMAP_VA_BITS - 1), and MMAP_VA_BITS saturates at
++// 48, so the stack top is 0x800000000000 under Sv48 and Sv57 alike and the top
++// user address is 0x7fffffffffff.  The offset is the one asan_mapping.h already
++// uses for every other 47-bit user address space, x86_64's included:
++//
++//   || `[0x10007fff8000, 0x7fffffffffff]` || HighMem    ||
++//   || `[0x02008fff7000, 0x10007fff7fff]` || HighShadow ||
++//   || `[0x00008fff7000, 0x02008fff6fff]` || ShadowGap  ||
++//   || `[0x00007fff8000, 0x00008fff6fff]` || LowShadow  ||
++//   || `[0x000000000000, 0x00007fff7fff]` || LowMem     ||
++//
++// Sv39 is the other plausible pin, and it is the wrong one here even though it
++// is what much riscv64 hardware runs and it would make the reservation 4GB
++// rather than 14TB.  A caller reasoning about these binaries quantifies the
++// initial stack pointer over the window a kernel can put it in, and on an Sv48
++// kernel every such stack address is above an Sv39 ceiling -- so an Sv39-sealed
++// binary would take the diagnostic path below on every admissible run, which is
++// worse than not sealing at all.  Changing this pin is these two constants and
++// the mapping table above; nothing else here depends on which it is.
++const uptr kSealedMaxUserVirtualAddress = 0x7fffffffffffULL;
++const uptr kSealedShadowOffset = 0x7fff8000ULL;
++#endif
++
++// The frame the runtime's initialization started on, recorded by __asan_init
++// before it calls anything, and 0 until it does.
++//
++// It has to be that frame and not the one that reads it.  What reads it is
++// GetThreadStackTopAndBottom, and what the bound it computes has to contain is a
++// local of SetThreadStackAndTls, which is one of its callers and therefore at a
++// higher address -- AsanThread checks it there, with CHECK(AddrIsInStack(&local)).
++// Rounding the reading frame up to a page usually covers the callers in between
++// and does not when that frame lands within a few hundred bytes below a page
++// boundary, which is a fact about the size of the environment, since that is
++// what moves the initial stack pointer.  A bound taken on the way in, above
++// every frame that will be checked against it, cannot have that argument made
++// about it.
++extern uptr sealed_init_frame;
++void SealedSetInitFrame(uptr frame);
++
++// The window sealed mode calls the main thread's stack, ending at the frame
++// __asan_init runs on.  Finding the real bounds means reading /proc/self/maps
++// for the [stack] segment and getrlimit(RLIMIT_STACK) for how far down it may
++// grow, which is a /proc read and a prlimit64; a fixed window needs neither.
++//
++// 8MB is Linux's default RLIMIT_STACK, so the window covers a stack that grows
++// to that limit, and the few KB above __asan_init's frame that it does not
++// cover are the argv and environ strings the kernel wrote there, which no
++// frame is ever placed in.  Nothing reads or writes this range on account of
++// these bounds; they decide how a stack address is described in a report and
++// how much shadow __asan_handle_no_return clears.
++const uptr kSealedMainStackSize = 8ULL << 20;
++
++}  // namespace __sanitizer
++
++#endif  // SANITIZER_SEALED_H

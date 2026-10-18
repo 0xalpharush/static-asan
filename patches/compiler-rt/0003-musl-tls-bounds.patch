@@ -1,0 +1,115 @@
+From b75d1f581794f85c6e594941ed7d4e29e686c568 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 22:37:23 -0700
+Subject: [PATCH] [sanitizer_common] cover musl's thread descriptor in the TLS
+ range
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: On musl ThreadDescriptorSize() returns 0 and GetTls() hands lsan a range
+that stops at the thread pointer, so the thread descriptor -- which holds
+the libc state a thread carries, including the pointer to its
+thread-specific data -- is never scanned as a root, and an allocation
+referenced only from there is reported as a leak.
+
+musl now exports sizeof(struct pthread) as __pthread_struct_size, since
+the size is neither part of its ABI nor computable from outside and
+changes with the architecture and the version.  Read it through a weak
+reference, so a libc without the symbol still links and keeps the old
+behaviour, and extend the TLS range by it.
+
+The two halves of this reach different architectures.  Making
+ThreadDescriptorSize() answer for musl is arch-neutral, and on x86_64 it
+is the whole change: GetTls() there takes the branch written for a TLS
+variant II target, which sets the range to end at the thread pointer plus
+ThreadDescriptorSize(), and that covers a descriptor sitting at the thread
+pointer as soon as the size stops being zero.  The second hunk, which
+moves the start of the range down, is in the branch a variant I target
+takes and is dead code on x86_64.
+
+Only that variant I path is exercised here -- measured on aarch64 musl
+1.2.6, the descriptor is 200 bytes and the scanned range now starts 16
+bytes into it, the gap that variant leaves above the thread pointer.  The
+two words that fall outside are the self pointer and one thread list link.
+So the two architectures do not end up equally covered: on x86_64 the
+descriptor is scanned whole, on aarch64 all but its first 16 bytes.
+
+Both of those extend whatever GetStaticTlsBoundary returned, and it
+returns an empty range when no module has a PT_TLS -- the case its own
+comment says can happen on musl.  Extending an empty range by a descriptor
+size that is no longer zero produces a range that is not there: on a
+variant I target *addr wraps past zero, on x86_64 the range starts at
+address 0.  So return early on an empty range instead.  Nothing reaches
+that branch under ASan, whose per-thread fake stack pointer puts a PT_TLS
+in every binary it links, but the failure only became possible with this
+change, so the guard belongs with it.
+
+This does not make pthread_setspecific values reachable the way it does on
+glibc, where they live inside the descriptor.  On musl the main thread's
+are in a global array, which lsan already scans, and a spawned thread's
+sit above its static TLS blocks, which nothing covers; that would need
+musl to export the range of the block as well.
+---
+ .../sanitizer_linux_libcdep.cpp               | 34 +++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+index 331e1c7d8..7ac279029 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+@@ -391,6 +391,23 @@ static uptr TlsPreTcbSize() {
+   return kTlsPreTcbSize;
+ }
+ #    endif
++#  elif SANITIZER_LINUX && !SANITIZER_ANDROID && !SANITIZER_GO
++// musl exports the size of its thread descriptor (sizeof(struct pthread)),
++// which is neither part of its ABI nor computable from outside.  GetTls() uses
++// it to bring the descriptor into the range lsan scans as a root, so that an
++// allocation whose only reference is in the libc state a thread carries there
++// is not reported as a leak.  Unlike glibc, musl does not keep the values set
++// with pthread_setspecific inside the descriptor -- the main thread's are in a
++// global array, and a spawned thread's sit above its static TLS blocks -- so
++// this does not cover those.  The reference is weak because a libc without the
++// symbol must still link; then this returns 0 and nothing is covered, which is
++// the behaviour that was here before.
++extern "C" __attribute__((weak)) const usize __pthread_struct_size;
++
++void InitTlsSize() {}
++uptr ThreadDescriptorSize() {
++  return &__pthread_struct_size ? __pthread_struct_size : 0;
++}
+ #  else   // (SANITIZER_FREEBSD || SANITIZER_GLIBC) && !SANITIZER_GO
+ void InitTlsSize() {}
+ uptr ThreadDescriptorSize() { return 0; }
+@@ -592,6 +609,12 @@ static void GetTls(uptr *addr, uptr *size) {
+ #    elif SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_SOLARIS
+   uptr align;
+   GetStaticTlsBoundary(addr, size, &align);
++  // No module has a PT_TLS, which its own comment says can happen on musl: the
++  // range is empty and there is nothing below to extend.  Extending it anyway
++  // wraps, on a variant I target by subtracting the thread descriptor size from
++  // zero, so stop here and leave it empty.
++  if (*size == 0)
++    return;
+ #      if defined(__x86_64__) || defined(__i386__) || defined(__s390__) || \
+           defined(__sparc__)
+   if (SANITIZER_GLIBC) {
+@@ -635,6 +658,17 @@ static void GetTls(uptr *addr, uptr *size) {
+   *addr -= tcb_size;
+   *size += tcb_size;
+ #          endif
++#        elif SANITIZER_LINUX && !SANITIZER_ANDROID
++  // musl. The thread descriptor sits directly below the thread pointer, so
++  // extending the range down by its size covers it. On a TLS variant I target
++  // the static TLS blocks start a little above the thread pointer, and the
++  // range is shifted up by that gap, so this can miss the first few words of
++  // the descriptor -- self and the thread list links, which hold nothing lsan
++  // is looking for. ThreadDescriptorSize() is 0 on a libc that does not export
++  // its size, and then this changes nothing.
++  const uptr tcb_size = ThreadDescriptorSize();
++  *addr -= tcb_size;
++  *size += tcb_size;
+ #        endif
+ #      endif
+ #    elif SANITIZER_NETBSD

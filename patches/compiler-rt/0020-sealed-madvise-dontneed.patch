@@ -1,0 +1,129 @@
+From 9233e9c4c4b8db85616682174e4e41e4effcddcc Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Fri, 11 Sep 2026 04:51:27 +0000
+Subject: [PATCH] [compiler-rt] sealed init: madvise(MADV_DONTNEED) for real,
+ and nothing else
+
+Sealed init dropped every madvise at internal_madvise, on the argument that
+all of it is advice: MADV_DONTNEED to hand freed pages back, MADV_DONTDUMP
+and MADV_[NO]HUGEPAGE on the shadow.  What that cost was not only resident
+memory.  In the model these binaries are verified against, a page of the
+MAP_NORESERVE shadow is charged to the run's budget when first touched and,
+with no madvise, never given back, so a program that allocates and frees
+large blocks under heavy traffic exhausts a budget its plain build does not
+(protobuf-c and harfbuzz, 64MiB inputs, a 512GiB budget).
+
+The one advice that returns pages is now issued
+for real again.  internal_madvise passes MADV_DONTNEED through and still
+drops every other advice, so the runtime makes the call from
+ReleaseMemoryPagesToOS -- on page-aligned ranges, inside mappings it made
+itself: the shadow of freed chunks (FlushUnneededASanShadowMemory from the
+allocator's unmap callback), of freed thread stacks and of fake stacks --
+and nothing else of the kind.  The specification gains the matching arm,
+madvise(addr, len, MADV_DONTNEED) on a page-aligned range inside a live
+anonymous mapping: returns 0, charges returned.  DONTDUMP and HUGEPAGE, which
+nothing models, stay dropped.  The allocator's own release-to-OS pass, which
+would return free chunk pages in the arena, stays pinned off
+(allocator_release_to_os_interval_ms = -1) because it reads the clock.
+
+The suite's syscall gate admits madvise with MADV_DONTNEED and no other
+advice value, as the one entry the runtime rather than the program
+justifies, and sealed_madvise proves both halves: killed by the filter
+without the entry, finished with it.
+---
+ compiler-rt/lib/asan/asan_flags.cpp           | 13 ++++++++++
+ .../lib/sanitizer_common/sanitizer_linux.cpp  | 25 ++++++++++++++-----
+ .../lib/sanitizer_common/sanitizer_sealed.h   | 12 ++++++---
+ 3 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
+index c7bbc66a4..a2b37c8d7 100644
+--- a/compiler-rt/lib/asan/asan_flags.cpp
++++ b/compiler-rt/lib/asan/asan_flags.cpp
+@@ -284,6 +284,19 @@ static void SealFlags() {
+   cf.heap_profile = false;
+   cf.allocator_release_to_os_interval_ms = -1;
+   cf.abort_on_error = true;
++  // The shadow is zeroed with memset and never re-mapped.  Above this
++  // threshold FastPoisonShadow zero-fills a shadow range by mapping fresh
++  // pages over it with MAP_FIXED instead of writing zeros, on every large
++  // allocation and every large free; in the model these binaries are
++  // verified against each of those is a new grant carved out of the shadow
++  // mapping, and the madvise(MADV_DONTNEED) that later hands the freed
++  // block's shadow back (patch 0020) may only cover a range inside ONE
++  // grant.  With the threshold at its maximum the three mappings made at
++  // start-up (SealedReserveShadow) are the only shadow grants for the life
++  // of the process, so every madvise the runtime issues lies inside one of
++  // them.  The cost is a memset of the shadow where an mmap was: 128KiB of
++  // zeros per MiB unpoisoned.
++  cf.clear_shadow_mmap_threshold = ~(uptr)0;
+   OverrideCommonFlags(cf);
+   // The shadow gap was protected before these flags were parsed
+   // (SealedReserveShadow), so the flag that would leave it open is pinned to
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+index 225c5d3bf..1ad1a5374 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp
+@@ -281,13 +281,26 @@ int internal_mprotect(void *addr, uptr length, int prot) {
+   return internal_syscall(SYSCALL(mprotect), (uptr)addr, length, prot);
+ }
+ 
++#  ifndef MADV_DONTNEED
++#    define MADV_DONTNEED 4
++#  endif
+ int internal_madvise(uptr addr, uptr length, int advice) {
+-  // Every advice this runtime gives is advice: MADV_DONTNEED to hand freed
+-  // pages back, MADV_DONTDUMP and MADV_[NO]HUGEPAGE on the shadow.  Dropping
+-  // them costs resident memory the allocator would have released and changes
+-  // nothing else, so sealed mode drops all of them at the one place they are
+-  // issued rather than at each caller.
+-  if (SealedInit())
++  // Every advice this runtime gives is advice, and sealed mode used to drop
++  // all of it here.  What that cost was not only resident memory: in the
++  // model these binaries are verified against, a page of the MAP_NORESERVE
++  // shadow is charged to the run's budget when first touched and, with no
++  // madvise, never given back, so a program that allocates and frees large
++  // blocks under heavy traffic exhausts a budget its plain build does not.
++  // The one advice that returns pages, MADV_DONTNEED, is issued for real now
++  // -- from ReleaseMemoryPagesToOS, on page-aligned ranges inside mappings
++  // the runtime made itself: the shadow of freed chunks, thread stacks and
++  // fake stacks -- and the specification models exactly that call (its arm:
++  // madvise 233, MADV_DONTNEED, page-aligned, inside a live anonymous
++  // mapping, returns 0, charges returned).  The rest -- MADV_DONTDUMP and
++  // MADV_[NO]HUGEPAGE on the shadow at start-up -- nothing models, and they
++  // stay dropped.  The allocator's own release-to-OS pass stays pinned off
++  // (allocator_release_to_os_interval_ms = -1), since it reads the clock.
++  if (SealedInit() && advice != MADV_DONTNEED)
+     return 0;
+   return internal_syscall(SYSCALL(madvise), addr, length, advice);
+ }
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+index 66eb3e0f1..59e43e57c 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+@@ -23,8 +23,13 @@
+ //     is not resolved either.
+ //   - no signal handler is installed and no alternate signal stack is set up,
+ //     so no rt_sigaction, sigaltstack or rt_sigprocmask.
+-//   - no madvise, so the allocator does not return pages to the OS and the
+-//     shadow is neither MADV_DONTDUMP nor MADV_NOHUGEPAGE.
++//   - madvise only with MADV_DONTNEED -- the shadow of freed memory, handed
++//     back so that the model's budget gets its charges back -- and no other
++//     advice: the shadow is neither MADV_DONTDUMP nor MADV_NOHUGEPAGE, and the
++//     allocator's own release-to-OS pass stays off, and the shadow is zeroed
++//     with memset rather than re-mapped, so that the three mappings made at
++//     start-up stay the only shadow grants and every madvise lies inside one
++//     of them.  See internal_madvise and SealFlags.
+ //   - no prlimit64: the core dumper is left alone and RLIMIT_STACK is not read.
+ //   - no getpid.
+ //   - a detection dies by SIGABRT rather than by exit_group: abort_on_error
+@@ -47,7 +52,8 @@
+ //     is an abort.  See SealedHangOnAllocationFailure below.
+ //
+ // What remains at start-up is mmap, munmap, mprotect and the program's own
+-// syscalls.  A run that reports an error is not sealed and is not meant to be:
++// syscalls, and from then on one more the program does not make, madvise
++// with MADV_DONTNEED, which the model names.  A run that reports an error is not sealed and is not meant to be:
+ // symbolization and the report itself do what they always did, except for the
+ // last event -- abort_on_error is pinned, so the death under a report is a
+ // SIGABRT rather than an exit status the program could also have produced.

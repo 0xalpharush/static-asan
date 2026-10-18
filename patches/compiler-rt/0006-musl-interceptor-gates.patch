@@ -1,0 +1,166 @@
+From b548c63ac2c6eb35029783139ce962976ff4ceb5 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 23:17:20 -0700
+Subject: [PATCH] [sanitizer_common] ask about musl at the sites that still ask
+ about glibc
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Patch 0005 fixed three interceptors selected by asking a question about
+glibc.  A sweep of the rest of sanitizer_platform_interceptors.h found four
+more, plus two struct checks switched off for musl instead of described.
+
+getrandom and getentropy are gated on __GLIBC_PREREQ(2, 25), preadv2 and
+pwritev2 on __GLIBC_PREREQ(2, 26).  __GLIBC_PREREQ is 0 off glibc, so all four
+conditions are 0 and no interceptor is compiled: the wrap list the link passes
+holds 376 entries and none of these names is in it.  musl has had getrandom and
+getentropy since 1.1.20 and preadv2 and pwritev2 since 1.2.5, all four as real
+definitions in libc.a with the prototypes the interceptors expect, so a static
+musl program can today write past the end of a buffer through any of them and
+nothing is reported -- getrandom(malloc(8), 16, 0) returns 16 and exits 0.  With
+musl asked instead of glibc the list is 380 entries, main calls __wrap_getrandom
+rather than getrandom, and the same program stops on a WRITE of size 16 zero
+bytes after an 8-byte region.  The other three behave the same way: getentropy a
+WRITE of size 32, preadv2 a WRITE of size 64, pwritev2 a READ of size 64.
+Upstream already knew about two of these; the line above preadv2 was a FIXME
+saying it is also available from musl 1.2.5.
+
+bcmp is the second site of the predefined-_GNU_SOURCE hazard 0005 diagnosed for
+strerror_r.  Its condition includes (SI_POSIX && _GNU_SOURCE), clang predefines
+_GNU_SOURCE for C++ on a musl target, and the interceptor translation units are
+C++, so it is 1 today and the interceptor runs.  It is 1 by accident: musl
+defines bcmp whatever _GNU_SOURCE says.  Say that instead.
+
+The two struct sites are the pattern 0004 objects to, a per-field check turned
+off rather than a libc described.  mmsghdr's size and offset checks are gated on
+__GLIBC_PREREQ(2, 14) while sendmmsg and recvmmsg are intercepted on Linux
+regardless, so the struct containing the msghdr 0004 just fixed was the one
+nobody checked.  It passes for musl unchanged -- 64 bytes total, msg_hdr 56 at
+0, msg_len 4 at 56 -- so turning it on costs nothing and closes the hole above
+the fix.
+
+ipc_perm is switched off for everything that is not glibc or FreeBSD.  Turning
+it on for musl fails exactly one of the seventeen checks in that block: musl
+spends a whole int on __ipc_perm_seq where the description has a 2-byte __seq
+beside a 2-byte __pad2, so CHECK_SIZE_AND_OFFSET(ipc_perm, __seq) is 2 == 4.
+Everything else agrees, including the mode field the disabled condition was
+really about -- 4 bytes at offset 20 on both sides, so glibc's 16-bit-mode
+caveat never applied to musl -- and both totals, ipc_perm 48 and shmid_ds 112.
+The totals are all the shmctl interceptor uses, so nothing misbehaves today.
+What was wrong was the description, and it is one field.
+---
+ .../sanitizer_platform_interceptors.h         | 30 ++++++++++++-------
+ .../sanitizer_platform_limits_posix.cpp       |  7 +++--
+ .../sanitizer_platform_limits_posix.h         |  6 ++++
+ 3 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
+index 2560c3feb..a90b5ff1f 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_interceptors.h
+@@ -174,9 +174,13 @@ SANITIZER_WEAK_IMPORT void *aligned_alloc(__sanitizer::usize __alignment,
+ #define SANITIZER_INTERCEPT_MEMMOVE 1
+ #define SANITIZER_INTERCEPT_MEMCPY 1
+ #define SANITIZER_INTERCEPT_MEMCMP SI_NOT_FUCHSIA
+-#define SANITIZER_INTERCEPT_BCMP \
+-  SANITIZER_INTERCEPT_MEMCMP &&  \
+-      ((SI_POSIX && _GNU_SOURCE) || SI_NETBSD || SI_FREEBSD)
++// musl always defines bcmp, whatever _GNU_SOURCE says -- and clang predefines
++// _GNU_SOURCE for C++ on a musl target, so the answer here is right today only
++// by accident.
++#define SANITIZER_INTERCEPT_BCMP                               \
++  SANITIZER_INTERCEPT_MEMCMP &&                                \
++      ((SI_POSIX && _GNU_SOURCE) || SI_NETBSD || SI_FREEBSD || \
++       SANITIZER_MUSL)
+ #define SANITIZER_INTERCEPT_STRNDUP SI_POSIX
+ #define SANITIZER_INTERCEPT___STRNDUP SI_GLIBC
+ #if defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && \
+@@ -611,13 +615,17 @@ SANITIZER_WEAK_IMPORT void *aligned_alloc(__sanitizer::usize __alignment,
+ #define SANITIZER_INTERCEPT_GETUSERSHELL (SI_POSIX && !SI_ANDROID)
+ #define SANITIZER_INTERCEPT_SL_INIT (SI_FREEBSD || SI_NETBSD)
+ 
+-#define SANITIZER_INTERCEPT_GETRANDOM \
+-  ((SI_LINUX && __GLIBC_PREREQ(2, 25)) || SI_FREEBSD || SI_SOLARIS)
++// musl has had getrandom since 1.1.20.
++#define SANITIZER_INTERCEPT_GETRANDOM                         \
++  ((SI_LINUX && (SANITIZER_MUSL || __GLIBC_PREREQ(2, 25))) || \
++   SI_FREEBSD || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT___CXA_ATEXIT SI_NETBSD
+ #define SANITIZER_INTERCEPT_ATEXIT SI_NETBSD
+ #define SANITIZER_INTERCEPT_PTHREAD_ATFORK SI_NETBSD
+-#define SANITIZER_INTERCEPT_GETENTROPY \
+-  ((SI_LINUX && __GLIBC_PREREQ(2, 25)) || SI_FREEBSD || SI_SOLARIS)
++// musl has had getentropy since 1.1.20.
++#define SANITIZER_INTERCEPT_GETENTROPY                        \
++  ((SI_LINUX && (SANITIZER_MUSL || __GLIBC_PREREQ(2, 25))) || \
++   SI_FREEBSD || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_QSORT \
+   (SI_POSIX && !SI_IOSSIM && !SI_WATCHOS && !SI_TVOS && !SI_ANDROID)
+ #define SANITIZER_INTERCEPT_QSORT_R SI_GLIBC
+@@ -633,9 +641,11 @@ SANITIZER_WEAK_IMPORT void *aligned_alloc(__sanitizer::usize __alignment,
+ #define SANITIZER_INTERCEPT_PROCCTL SI_FREEBSD
+ #define SANITIZER_INTERCEPT_ARGP_PARSE SI_GLIBC
+ #define SANITIZER_INTERCEPT_CPUSET_GETAFFINITY SI_FREEBSD
+-// FIXME: also available from musl 1.2.5
+-#define SANITIZER_INTERCEPT_PREADV2 (SI_LINUX && __GLIBC_PREREQ(2, 26))
+-#define SANITIZER_INTERCEPT_PWRITEV2 (SI_LINUX && __GLIBC_PREREQ(2, 26))
++// musl has had preadv2 and pwritev2 since 1.2.5.
++#define SANITIZER_INTERCEPT_PREADV2 \
++  (SI_LINUX && (SANITIZER_MUSL || __GLIBC_PREREQ(2, 26)))
++#define SANITIZER_INTERCEPT_PWRITEV2 \
++  (SI_LINUX && (SANITIZER_MUSL || __GLIBC_PREREQ(2, 26)))
+ #if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+     __MAC_OS_X_VERSION_MIN_REQUIRED >= 130000
+ #  define SI_MAC_OS_DEPLOYMENT_MIN_13_00 1
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+index 8e514efec..d51d964f3 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+@@ -1089,7 +1089,8 @@ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_len);
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_level);
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_type);
+ 
+-#  if SANITIZER_LINUX && (SANITIZER_ANDROID || __GLIBC_PREREQ(2, 14))
++#  if SANITIZER_LINUX && \
++      (SANITIZER_ANDROID || SANITIZER_MUSL || __GLIBC_PREREQ(2, 14))
+ CHECK_TYPE_SIZE(mmsghdr);
+ CHECK_SIZE_AND_OFFSET(mmsghdr, msg_hdr);
+ CHECK_SIZE_AND_OFFSET(mmsghdr, msg_len);
+@@ -1202,7 +1203,7 @@ CHECK_SIZE_AND_OFFSET(mntent, mnt_passno);
+ 
+ CHECK_TYPE_SIZE(ether_addr);
+ 
+-#if SANITIZER_GLIBC || SANITIZER_FREEBSD
++#if SANITIZER_GLIBC || SANITIZER_FREEBSD || SANITIZER_MUSL
+ CHECK_TYPE_SIZE(ipc_perm);
+ # if SANITIZER_FREEBSD
+ CHECK_SIZE_AND_OFFSET(ipc_perm, key);
+@@ -1215,7 +1216,7 @@ CHECK_SIZE_AND_OFFSET(ipc_perm, uid);
+ CHECK_SIZE_AND_OFFSET(ipc_perm, gid);
+ CHECK_SIZE_AND_OFFSET(ipc_perm, cuid);
+ CHECK_SIZE_AND_OFFSET(ipc_perm, cgid);
+-#if !SANITIZER_LINUX || __GLIBC_PREREQ (2, 31)
++#if !SANITIZER_LINUX || SANITIZER_MUSL || __GLIBC_PREREQ (2, 31)
+ /* glibc 2.30 and earlier provided 16-bit mode field instead of 32-bit
+    on many architectures.  */
+ CHECK_SIZE_AND_OFFSET(ipc_perm, mode);
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+index 4b969f8ac..e7c99b6c6 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+@@ -232,8 +232,14 @@ struct __sanitizer_ipc_perm {
+   unsigned long long __unused2;
+ #else
+   unsigned int mode;
++#if SANITIZER_MUSL
++  // musl spends the whole word on the sequence number.  Everything else about
++  // the struct, the total included, is the same.
++  int __seq;
++#else
+   unsigned short __seq;
+   unsigned short __pad2;
++#endif
+ #if defined(__x86_64__) && !defined(_LP64)
+   u64 __unused1;
+   u64 __unused2;

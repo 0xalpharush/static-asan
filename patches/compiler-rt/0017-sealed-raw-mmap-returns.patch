@@ -1,0 +1,86 @@
+From a92a40780b1f543a4ada89dff3b1c2169978a329 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Sun, 30 Aug 2026 19:12:59 +0000
+Subject: [PATCH] [compiler-rt] sealed init: the last two unchecked raw mmap
+ returns
+
+Patch 0016 caught the raw -errno at ReservedAddressRange::Init, which is where
+it could reach InitAligned's fixup and the secondary's CHECK(p).  Two more
+callers consume an unchecked raw return, and this closes them so that the claim
+about mechanism (C) is a claim about ALL of it rather than about the consumers
+someone found.
+
+The enumeration, from the patched tree.  Every caller of MmapNoAccess and
+MmapFixedNoAccess on Linux:
+
+  ReservedAddressRange::Init          raw, and 0016 guards it
+  MapDynamicShadow                   raw, UNGUARDED  <- this patch
+  MapDynamicShadowAndAliases         raw, UNGUARDED  <- this patch
+  ProtectGap (x2)                    compares res against addr -> checked
+  tsan  MemoryRangeIsAvailable       compares against beg    -> checked
+  msan  ProtectMemoryRange (x2)      compares against beg    -> checked
+  dfsan (x2)                         compares against beg    -> checked
+
+So the unchecked set has exactly three members and 0016 covered one.  Everything
+else that takes one of these two functions' results compares it against the
+address it asked for, which detects a -errno implicitly.
+
+MapDynamicShadow has the identical defect to Init's, not merely a similar one:
+MmapNoAccess returns (uptr)-errno, the CHECK_NE below it rejects only exactly
+-1, so every other errno passes, the RoundUpTo wraps, and what comes out is
+UnmapFromTo's "(to >= from) != 0" with an empty stack and no mention of memory
+or mmap.  That message is already known here -- toolchain/Dockerfile's
+build-time check had to learn to accept it as a second spelling of "could not
+reserve the shadow".
+
+NEITHER IS REACHABLE IN A SEALED ASan BINARY, and that is deliberate rather than
+an oversight to hunt for: FindDynamicShadowStart returns kSealedShadowOffset
+before it gets to MapDynamicShadow, which is what pinning the riscv64 offset was
+for, and MapDynamicShadowAndAliases is hwasan's alone.  They are converted on
+0015's own stated rule -- the shadow-interleave abort in asan_shadow_setup.cpp
+was guarded on exactly this basis, "held to the same rule so that it is not an
+exception waiting to become one".  A reviewer should not look for a reachable
+path; there isn't one today, and the point is that the rule does not depend on
+that staying true.
+
+Written with inline internal_iserror to match 0016 rather than introducing a
+helper.  Nothing changes in an unsealed binary, and nothing changes in a sealed
+one either, since neither site is reached -- the guard inventory goes from
+eleven to thirteen and the observable behaviour of every binary this project
+builds is unchanged.
+---
+ .../sanitizer_common/sanitizer_linux_libcdep.cpp   | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+index 794fbf1a0..8ea6a5ee4 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp
+@@ -1126,6 +1126,16 @@ uptr MapDynamicShadow(uptr shadow_size_bytes, uptr shadow_scale,
+   const uptr map_size = shadow_size + left_padding + alignment;
+ 
+   const uptr map_start = (uptr)MmapNoAccess(map_size);
++  // The same unchecked raw return as ReservedAddressRange::Init's, and the same
++  // reason the CHECK below does not catch it: MmapNoAccess hands back
++  // (uptr)-errno and CHECK_NE rejects only exactly -1, so every other errno
++  // passes, the RoundUpTo wraps, and the failure surfaces as UnmapFromTo's
++  // "(to >= from) != 0" with no mention of memory.  Unreachable in a sealed
++  // ASan binary -- FindDynamicShadowStart answers kSealedShadowOffset before it
++  // gets here -- and held to the rule anyway, the way the shadow-interleave
++  // abort is.  See SealedHangOnAllocationFailure.
++  if (UNLIKELY(internal_iserror(map_start)))
++    SealedHangOnAllocationFailure();
+   CHECK_NE(map_start, ~(uptr)0);
+ 
+   const uptr shadow_start = RoundUpTo(map_start + left_padding, alignment);
+@@ -1184,6 +1194,10 @@ uptr MapDynamicShadowAndAliases(uptr shadow_size, uptr alias_size,
+   const uptr map_size = left_padding + 2 * alignment;
+ 
+   const uptr map_start = reinterpret_cast<uptr>(MmapNoAccess(map_size));
++  // The last unchecked raw return in the tree; hwasan's, and no ASan binary
++  // reaches it.  See SealedHangOnAllocationFailure.
++  if (UNLIKELY(internal_iserror(map_start)))
++    SealedHangOnAllocationFailure();
+   CHECK_NE(map_start, static_cast<uptr>(-1));
+   const uptr right_start = RoundUpTo(map_start + left_padding, alignment);
+ 

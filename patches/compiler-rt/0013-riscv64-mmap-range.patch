@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Thu, 20 Aug 2026 06:30:00 +0000
+Subject: [PATCH] [compiler-rt] riscv64: size the mmap range by the window mmap
+ allocates from
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The previous patch pins a sealed riscv64 binary to the Sv48 layout: it
+answers GetMaxVirtualAddress() with 0x7fffffffffff and places the shadow at
+0x7fff8000, and __asan_init refuses to run at all on a kernel that puts the
+stack above that.  sanitizer_platform.h was left saying something else about
+the same address space -- SANITIZER_MMAP_RANGE_SIZE for riscv64 is 1ULL << 56 --
+so the binary asserts a 47-bit address space for its shadow and reserves a
+bytemap for a 56-bit one.
+
+What that costs is .bss, and it is not a disk cost: .bss is zero bytes in the
+file and `memsz` in a LOAD segment, so it is paid by anything that ingests LOAD
+segments rather than file contents.  SANITIZER_MMAP_RANGE_SIZE is read by five
+allocator configurations as kSpaceSize; on Linux/riscv64 exactly one of them is
+in an ASan binary, because SANITIZER_CAN_USE_ALLOCATOR64 is 1 there and ASan's
+own primary is a SizeClassAllocator64 over a named 128G region.  The one left is
+the internal allocator's SizeClassAllocator32, where kSpaceSize picks the
+ByteMap that maps a 1MB region to its size class:
+
+  kTwoLevelByteMapSize1 = (kSpaceSize >> 20) >> 12
+
+  1ULL << 56  ->  2^24 entries  ->  map1_ is 128MiB
+  1ULL << 47  ->  2^15 entries  ->  map1_ is 256KiB
+
+Measured, riscv64, `int main(void){return 0;}` linked with asan-musl.cfg:
+__sanitizer::internal_alloc_placeholder goes from 134,484,032 bytes to 528,448,
+and the four LOAD segments' memsz from 145,190,120 (138.46MiB) to 11,234,544
+(10.71MiB).  The same program linked with asan-musl-sealed.cfg gives the same
+numbers, before and after, because the seal is a --defsym and this is a
+compile-time constant.
+
+That last clause is why this is not conditional on sealed mode, and it is worth
+saying plainly: one libclang_rt.asan.a serves both modes, the ByteMap's size is
+a template parameter, and a link-time symbol cannot choose a type.  So the
+question is not "is 1ULL << 47 right for a sealed binary" but "is it right for
+Linux/riscv64", and it is.  arch/riscv allocates an unhinted mmap from
+DEFAULT_MAP_WINDOW = 1 << (MMAP_VA_BITS - 1) with MMAP_VA_BITS saturating at 48,
+so the stack top is 0x800000000000 and no address a process is given without
+asking for one reaches 1ULL << 47 -- on Sv39, Sv48 and Sv57 alike.  1ULL << 56
+is the width of the widest address Sv57's page tables can name, which is not the
+same question.  The FIXME above the block says as much, and the two arms around
+this one are the precedent: Fuchsia's riscv64 already writes 1ULL << 38 here,
+and non-Apple aarch64 writes 1ULL << 48 on a Linux that can run a 52-bit VA.
+
+The allocator is not narrowed by this.  Its regions come from
+MmapAlignedOrDieOnFatalError with no hint, which is exactly what the window
+bounds; pointers above kSpaceSize are still handled, because PointerIsMine
+range-checks before it indexes and routes them to the secondary; and a region
+that did land above the bound would fail the CHECK_LT in ComputeRegionId, which
+is a loud abort at map time and not a mismapped byte.  What is narrowed is a
+riscv64 Linux kernel that hands out unhinted mappings above 1 << 47, which is
+also a kernel a sealed binary already refuses and an unsealed one has no shadow
+for.
+
+The two constants are held equal by a static_assert in sanitizer_sealed.h rather
+than by a comment, because a comment is what let them drift apart the first
+time.
+---
+ .../lib/sanitizer_common/sanitizer_platform.h | 29 +++++++++++++++++++
+ .../lib/sanitizer_common/sanitizer_sealed.h   | 20 +++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform.h b/compiler-rt/lib/sanitizer_common/sanitizer_platform.h
+index 5796640..1953fca 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform.h
+@@ -321,6 +321,35 @@
+ // assumed to be some constant integer.
+ #  if SANITIZER_FUCHSIA
+ #    define SANITIZER_MMAP_RANGE_SIZE (1ULL << 38)
++#  elif SANITIZER_LINUX
++// Linux/riscv64 is the case the FIXME above is answered for here, and the
++// answer is the width of the window mmap picks from rather than the width of
++// the hardware's addresses.  RISC-V has Sv39, Sv48 and Sv57, so the widest
++// address a page table can name is 56 bits and 1ULL << 56 is what the fallback
++// below writes down; but arch/riscv caps the window an unhinted mmap allocates
++// from at DEFAULT_MAP_WINDOW = 1 << (MMAP_VA_BITS - 1), and MMAP_VA_BITS
++// saturates at 48 -- so the stack top is 0x800000000000 and the top address a
++// process is given without asking for one is 0x7fffffffffff, on Sv48 and Sv57
++// alike.  That is the same fact sealed init pins, and the two are held equal by
++// a static_assert in sanitizer_sealed.h.
++//
++// What reads this on Linux/riscv64 is one allocator: SANITIZER_CAN_USE_ALLOCATOR64
++// is 1 here, so ASan's own primary is SizeClassAllocator64 over a named 128G
++// region and does not consult it, and the reader left is the internal
++// allocator's SizeClassAllocator32, where kSpaceSize sizes the first level of
++// the bytemap that maps a region address to its size class.  1ULL << 56 makes
++// that array 2^24 entries, 128MiB of .bss in every riscv64 binary that links a
++// sanitizer, against 256KiB here.  Nothing is unmapped by the change: the
++// allocator's regions come from an unhinted mmap, which is exactly what the
++// window bounds, and a region that somehow landed above it would fail the
++// CHECK_LT in ComputeRegionId rather than be silently mismapped.
++//
++// The non-Apple aarch64 case below is the precedent: Linux/aarch64 can run a
++// 52-bit VA and the value written there is 1ULL << 48, for this reason.  So is
++// the SANITIZER_FUCHSIA arm just above, which is 1ULL << 38 on the same
++// hardware this fallback calls 56-bit, because Fuchsia's riscv64 user address
++// space is a known width.
++#    define SANITIZER_MMAP_RANGE_SIZE (1ULL << 47)
+ #  else
+ #    define SANITIZER_MMAP_RANGE_SIZE FIRST_32_SECOND_64(1ULL << 32, 1ULL << 56)
+ #  endif
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+index 77858ae..385a4dc 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
+@@ -113,6 +113,26 @@ inline bool SealedInit() { return &__sanitizer_sealed_init != nullptr; }
+ // the mapping table above; nothing else here depends on which it is.
+ const uptr kSealedMaxUserVirtualAddress = 0x7fffffffffffULL;
+ const uptr kSealedShadowOffset = 0x7fff8000ULL;
++
++// The pin above is one statement about the address space, and
++// SANITIZER_MMAP_RANGE_SIZE is the same statement made in sanitizer_platform.h,
++// where it sizes the first level of the bytemap the internal allocator uses to
++// find a region's size class.  They were allowed to disagree once -- the pin
++// said Sv48 and the range size said 56 bits -- and the cost of that was not
++// wrongness but 128MiB of .bss where 256KiB was called for.  A header that
++// sanitizer_platform.h could include would be the tidier fix; it includes
++// nothing, by design, so this is what holds the two together: move the pin and
++// this stops the build until the other moves with it.
++//
++// It is an equality and not just the soundness bound (>=), deliberately.  The
++// bound is what makes the allocator correct, and a range size larger than the
++// pin would satisfy it; but a binary that pins Sv48 and then reserves a bytemap
++// for an address space it has just said it will refuse to run in is carrying
++// the cost of a generality the seal has already spent.
++static_assert(kSealedMaxUserVirtualAddress == SANITIZER_MMAP_RANGE_SIZE - 1,
++              "sealed riscv64 pins the top user address, and "
++              "SANITIZER_MMAP_RANGE_SIZE names the same address space; they "
++              "have to be the same number");
+ #endif
+ 
+ // The frame the runtime's initialization started on, recorded by __asan_init
+-- 
+2.43.0
+

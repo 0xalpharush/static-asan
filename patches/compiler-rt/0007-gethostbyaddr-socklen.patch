@@ -1,0 +1,55 @@
+From bda16151b758fcc9a6027f07dd3a71dcf0a108db Mon Sep 17 00:00:00 2001
+From: Theorem Labs
+Date: Mon, 17 Aug 2026 23:23:58 -0700
+Subject: [PATCH] [sanitizer_common] read gethostbyaddr's length as the
+ socklen_t it is
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The second argument of gethostbyaddr and gethostbyaddr_r is a socklen_t --
+in musl, in glibc and in POSIX -- and the interceptors declare it int.  The
+width is the same, so nothing truncates, but the value is not merely passed
+through: it is the size of the range the interceptor marks as read.
+
+  COMMON_INTERCEPTOR_READ_RANGE(ctx, addr, len);
+
+READ_RANGE takes a uptr, so a length with the top bit set sign-extends to
+something near 2^64 and the sanitizer reports on a program that read nothing
+out of bounds:
+
+  gethostbyaddr(malloc(4), 0x80000004u, AF_INET);
+  ==742==ERROR: AddressSanitizer: negative-size-param: (size=-2147483644)
+
+No real caller passes a length above 2GB -- it is 4 or 16 -- so this is a
+report that cannot be provoked by accident, and it is not specific to musl.
+It is still a wrong answer from an unmodified program, and the fix is the
+declaration.
+---
+ .../lib/sanitizer_common/sanitizer_common_interceptors.inc  | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+index a91bd64e8..bbd7a1c13 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc
+@@ -2959,8 +2959,8 @@ INTERCEPTOR(struct __sanitizer_hostent *, gethostbyname, char *name) {
+   return res;
+ }
+ 
+-INTERCEPTOR(struct __sanitizer_hostent *, gethostbyaddr, void *addr, int len,
+-            int type) {
++INTERCEPTOR(struct __sanitizer_hostent *, gethostbyaddr, void *addr,
++            unsigned len, int type) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, gethostbyaddr, addr, len, type);
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, addr, len);
+@@ -3046,7 +3046,7 @@ INTERCEPTOR(int, gethostent_r, struct __sanitizer_hostent *ret, char *buf,
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_GETHOSTBYADDR_R
+-INTERCEPTOR(int, gethostbyaddr_r, void *addr, int len, int type,
++INTERCEPTOR(int, gethostbyaddr_r, void *addr, unsigned len, int type,
+             struct __sanitizer_hostent *ret, char *buf, SIZE_T buflen,
+             __sanitizer_hostent **result, int *h_errnop) {
+   void *ctx;
