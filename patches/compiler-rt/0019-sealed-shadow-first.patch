@@ -85,12 +85,12 @@ sealed_shadow_layout are those two measurements.
  6 files changed, 211 insertions(+), 52 deletions(-)
 
 diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
-index 4898ef75c..c7bbc66a4 100644
+index 39ec3feb0..7b8bbce14 100644
 --- a/compiler-rt/lib/asan/asan_flags.cpp
 +++ b/compiler-rt/lib/asan/asan_flags.cpp
-@@ -285,6 +285,10 @@ static void SealFlags() {
-   cf.allocator_release_to_os_interval_ms = -1;
-   cf.abort_on_error = true;
+@@ -300,6 +300,10 @@ static void SealFlags() {
+   cf.print_module_map = 0;
+   cf.decorate_proc_maps = false;
    OverrideCommonFlags(cf);
 +  // The shadow gap was protected before these flags were parsed
 +  // (SealedReserveShadow), so the flag that would leave it open is pinned to
