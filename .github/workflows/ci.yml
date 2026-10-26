@@ -20,6 +20,14 @@
 #     Only a push to main writes it; a pull request reads it and writes nothing.
 # The weekly run reads no layer cache, so it rebuilds everything, and it resolves
 # the `~series` Alpine pins again (README.md, "Pinned versions").
+#
+# Which jobs run is decided per run from the change itself: the route job diffs the
+# commit against its base (a pull request's merge commit against the base branch; a
+# push against the commit main pointed at before).  A change that touches only
+# documentation (*.md, LICENSE*, .gitignore) builds nothing; any other file, this
+# workflow and its pinned commits included, builds every target.  The weekly and the
+# manual runs always build every target.  The `ci` job always runs, reads every
+# job's result and is the one check to require.
 name: CI
 on:
   push:
@@ -43,10 +51,53 @@ env:
   LLVM_COMMIT: 87f0227cb60147a26a1eeb4fb06e3b505e9c7261
 
 jobs:
+  route:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.route.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: decide from the change which jobs run
+        id: route
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base=
+          case $EVENT in
+            pull_request) base=$(git rev-parse --verify -q 'HEAD^1') || base= ;;
+            push)
+              if [[ $BEFORE =~ ^[0-9a-f]{40}$ && $BEFORE != 0000000000000000000000000000000000000000 ]] \
+                  && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                base=$BEFORE
+              fi ;;
+          esac
+          if [[ -z $base ]]; then
+            build=true
+            echo "$EVENT: no base to diff against; every target builds"
+          else
+            build=false
+            while IFS= read -r f; do
+              case $f in
+                *.md | LICENSE* | .gitignore) echo "documentation: $f" ;;
+                *) echo "builds: $f"; build=true ;;
+              esac
+            done < <(git diff --name-only "$base" HEAD)
+          fi
+          echo "build=$build" | tee -a "$GITHUB_OUTPUT"
+
   # One job fetches the sources and saves them, and every target restores those same
   # bytes.  BuildKit keys its layer cache on the contents of the build contexts, so all
   # targets must read one copy for the layer cache to hit on the next run.
   sources:
+    needs: route
+    if: needs.route.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -183,3 +234,27 @@ jobs:
           ! grep -q . "$dir/dynsyms" || { echo "::error::the binary has a dynamic symbol table"; cat "$dir/dynsyms"; exit 1; }
           grep -q __asan_init <(readelf -sW "$dir/hello") || { echo "::error::the binary has no ASan runtime"; exit 1; }
           echo "no PT_INTERP, no DT_NEEDED, no dynamic symbol table; ASan runtime linked"
+
+  # The one check to require.  It runs whatever happened above: it passes when the
+  # route job chose the jobs and each chosen job passed, and fails otherwise.
+  ci:
+    needs: [route, sources, toolchain]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: every chosen job passed
+        env:
+          ROUTE: ${{ needs.route.result }}
+          BUILD: ${{ needs.route.outputs.build }}
+          SOURCES: ${{ needs.sources.result }}
+          TOOLCHAIN: ${{ needs.toolchain.result }}
+        run: |
+          set -euo pipefail
+          echo "route: $ROUTE (build=$BUILD); sources: $SOURCES; toolchain: $TOOLCHAIN"
+          [[ $ROUTE == success ]] || { echo "::error::the route job did not pass"; exit 1; }
+          if [[ $BUILD == true ]]; then
+            [[ $SOURCES == success && $TOOLCHAIN == success ]] || { echo "::error::a build job did not pass"; exit 1; }
+          else
+            [[ $SOURCES == skipped && $TOOLCHAIN == skipped ]] || { echo "::error::the route chose no build, yet a build job ran"; exit 1; }
+          fi
