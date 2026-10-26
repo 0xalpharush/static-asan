@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 0xalpharush <0xalpharush@protonmail.com>
+Date: Sun, 26 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [compiler-rt] silent reports: close the syslog door too
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: Patch 0014 made the silent runtime write nothing by putting SilentReports()
+behind the two doors report text leaves through: ReportFile::Write (everything
+Printf(), Report() and RawWrite() funnel through it) and CatastrophicErrorWrite
+(CHECK/Die()).  There is a third door it missed.
+
+SharedPrintfCodeNoBuffer (sanitizer_printf.cpp) does not stop at RawWrite().
+After the bytes go to the report file it runs two more sinks on the same
+buffer: CallPrintfAndReportCallback(buffer) and LogMessageOnPrintf(buffer).
+The second is the leak.  On Linux LogMessageOnPrintf, when common_flags()->
+log_to_syslog is set, calls WriteToSyslog -> the libc syslog() (sanitizer_linux_
+libcdep.cpp), which writes the full report to /dev/log over a path that never
+touches ReportFile::Write and so never saw patch 0014's test.  log_to_syslog is
+an ordinary common flag: a program (or a downstream __asan_default_options())
+can set it, and neither the seal nor the silent mode pins it off.  A silent --
+or sealed-and-silent -- binary with log_to_syslog=1 therefore still emits the
+whole report, just to syslogd instead of to fd 2.  Audited: a silent build with
+log_to_syslog=1 put 3,562 bytes of report on /dev/log while writing nothing to
+stderr, which is exactly the writes a silent binary is meant not to make.
+
+The fix guards the runtime-owned sink under the same SilentReports() test the
+other two doors use, so the three report exits now agree.  The guard is placed
+to draw the line the silent contract draws: LogMessageOnPrintf is the runtime
+itself re-emitting its report to a second transport, a runtime-owned write, and
+it is suppressed.  CallPrintfAndReportCallback immediately above it is left
+alone: it hands the buffer to a callback the *program* installed with
+__sanitizer_set_report_fd / set_report_callback, which is program output, not a
+runtime write, and silencing it would silence the process rather than the
+runtime -- the same boundary patch 0014 draws when it leaves printf and
+fprintf(stderr) in the program untouched.  A program that installs a callback
+and also wants it silent controls that itself.
+
+Touches sanitizer_common, so this test compiles into every sanitizer's archive,
+the same scope as patch 0014's two guards.  Off unless the link defines
+__sanitizer_silent_reports; an ordinary build is unchanged.
+---
+ compiler-rt/lib/sanitizer_common/sanitizer_printf.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_printf.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_printf.cpp
+@@ -16,6 +16,7 @@
+ #include "sanitizer_common.h"
+ #include "sanitizer_flags.h"
+ #include "sanitizer_libc.h"
++#include "sanitizer_silent.h"
+ 
+ #include <stdio.h>
+ #include <stdarg.h>
+@@ -294,7 +295,15 @@
+   // Remove color sequences from the message.
+   RemoveANSIEscapeSequencesFromString(buffer);
+   CallPrintfAndReportCallback(buffer);
+-  LogMessageOnPrintf(buffer);
++  // Silent reports close the runtime-owned report sinks.  The callback above
++  // is the program's own CallPrintfAndReportCallback and is left alone -- it
++  // is program output, not a runtime write.  LogMessageOnPrintf is the runtime
++  // itself writing the report to syslog when log_to_syslog is set, a
++  // runtime-owned sink ReportFile::Write never sees; close it under the same
++  // test, or a silent (or sealed) binary still emits the full report to
++  // /dev/log.  See sanitizer_silent.h.
++  if (!SilentReports())
++    LogMessageOnPrintf(buffer);
+ 
+   va_end(args2);
+ }
+-- 
+2.39.5
