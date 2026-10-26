@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 0xalpharush <0xalpharush@protonmail.com>
+Date: Sun, 26 Oct 2026 00:00:02 +0000
+Subject: [PATCH] [compiler-rt] RFC: share the sanitizer-neutral seal pins
+ between ASan and MSan
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: RFC / optional, and worth landing only after MSan's SealFlags (PR #6) and
+the ASan map-decoration pins (F5) settle -- see the PR description.  The seal
+fixes a set of flags that have nothing to do with which sanitizer is running:
+the six handle_* signal modes, use_sigaltstack, the two rss limits,
+malloc_context_size, compress_stack_depot, print_module_map, decorate_proc_maps
+and abort_on_error.  ASan's SealFlags (patch 0012, extended by F5) sets them,
+and MSan's SealFlags (PR #6) sets the same values a second time.  Two copies of
+one list drift.
+
+This moves the shared list into sanitizer_common as SealCommonFlags
+(sanitizer_sealed_flags.h) and has ASan's SealFlags call it, so the
+sanitizer-neutral pins have one definition.  Each SealFlags keeps its own
+sanitizer-specific pins around the call -- ASan's detect_leaks, heap_profile,
+disable_coredump, allocator_release_to_os_interval_ms, clear_shadow_mmap_
+threshold and protect_shadow_gap stay in asan_flags.cpp -- and each still calls
+OverrideCommonFlags itself, after the copy from common_flags(), so the ordering
+the seal depends on (pins applied after __asan_default_options()) is unchanged.
+Behaviour is identical to F5's: the same flags end up pinned to the same values;
+only the source of the sanitizer-neutral ones moves.
+
+Because this patch is cut against main, where SealFlags does not yet set the
+four F5 flags, applying it also introduces those four (through the helper) --
+it therefore overlaps F5 and should be reconciled with it, not stacked blindly:
+whichever of the two lands first, the other becomes the dedup.  Likewise PR #6's
+MSan SealFlags should be switched to call SealCommonFlags rather than repeat the
+list; that one-line change is left to PR #6 so this patch touches no MSan file.
+Kept deliberately minimal: one new header and one call site.
+---
+ compiler-rt/lib/asan/asan_flags.cpp                | 14 ++++----
+ .../lib/sanitizer_common/sanitizer_sealed_flags.h  | 61 ++++++++++++++++++++++
+ 2 files changed, 67 insertions(+), 7 deletions(-)
+ create mode 100644 compiler-rt/lib/sanitizer_common/sanitizer_sealed_flags.h
+
+diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
+--- a/compiler-rt/lib/asan/asan_flags.cpp
++++ b/compiler-rt/lib/asan/asan_flags.cpp
+@@ -21,6 +21,7 @@
+ #include "sanitizer_common/sanitizer_flag_parser.h"
+ #include "sanitizer_common/sanitizer_flags.h"
+ #include "sanitizer_common/sanitizer_sealed.h"
++#include "sanitizer_common/sanitizer_sealed_flags.h"
+ #include "sanitizer_common/sanitizer_win_interception.h"
+ #include "ubsan/ubsan_flags.h"
+ #include "ubsan/ubsan_platform.h"
+@@ -270,20 +271,17 @@
+     return;
+   CommonFlags cf;
+   cf.CopyFrom(*common_flags());
+-  cf.handle_segv = kHandleSignalNo;
+-  cf.handle_sigbus = kHandleSignalNo;
+-  cf.handle_abort = kHandleSignalNo;
+-  cf.handle_sigill = kHandleSignalNo;
+-  cf.handle_sigtrap = kHandleSignalNo;
+-  cf.handle_sigfpe = kHandleSignalNo;
+-  cf.use_sigaltstack = false;
++  // The sanitizer-neutral seal pins -- handle_*, use_sigaltstack, the rss
++  // limits, malloc_context_size, compress_stack_depot, print_module_map,
++  // decorate_proc_maps and abort_on_error -- live in sanitizer_common so that
++  // ASan's SealFlags and MSan's set the identical values from one definition
++  // (sanitizer_sealed_flags.h).  The pins below this call are the ones that are
++  // specific to ASan.
++  SealCommonFlags(cf);
+   cf.disable_coredump = false;
+   cf.detect_leaks = false;
+-  cf.hard_rss_limit_mb = 0;
+-  cf.soft_rss_limit_mb = 0;
+   cf.heap_profile = false;
+   cf.allocator_release_to_os_interval_ms = -1;
+-  cf.abort_on_error = true;
+   // The shadow is zeroed with memset and never re-mapped.  Above this
+   // threshold FastPoisonShadow zero-fills a shadow range by mapping fresh
+   // pages over it with MAP_FIXED instead of writing zeros, on every large
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_sealed_flags.h b/compiler-rt/lib/sanitizer_common/sanitizer_sealed_flags.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_sealed_flags.h
+@@ -0,0 +1,61 @@
++//===-- sanitizer_sealed_flags.h --------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// The flag pins that a sealed init applies and that do not depend on which
++// sanitizer is running, in one place.  ASan's SealFlags() (asan_flags.cpp) and
++// MSan's set the same sanitizer-neutral flags for the same reason: each is a
++// way for a healthy run's behaviour -- its syscalls, the size of its stack
++// depot -- to depend on something other than the program and its input, and a
++// sealed binary exists not to have that dependence.  The per-sanitizer
++// SealFlags() keeps its own pins (ASan's detect_leaks, shadow-gap protection
++// and clear_shadow_mmap_threshold; MSan's own), applies these in between, and
++// calls OverrideCommonFlags() itself.
++//
++// Applied, like every seal pin, after the compile-time default,
++// ASAN_DEFAULT_OPTIONS and __asan_default_options() have all been parsed, so
++// the guarantee is a property of the link and not of what a program's hook
++// asked for.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef SANITIZER_SEALED_FLAGS_H
++#define SANITIZER_SEALED_FLAGS_H
++
++#include "sanitizer_flags.h"
++
++namespace __sanitizer {
++
++// The sanitizer-neutral seal pins.  Each handle_* flag and use_sigaltstack is
++// a signal-handler syscall the mode exists not to make; the rss limits start a
++// background watcher; malloc_context_size at 1 records one frame per
++// allocation instead of walking up to 30, so the stack depot does not grow
++// with the workload; compress_stack_depot off keeps the depot's compression
++// thread (a clone) from starting; print_module_map reads /proc/self/maps and
++// decorate_proc_maps names mappings with prctl; abort_on_error turns the exit
++// of a run that found a bug into a SIGABRT no healthy run emits.  The caller
++// supplies a CommonFlags already copied from common_flags().
++inline void SealCommonFlags(CommonFlags &cf) {
++  cf.handle_segv = kHandleSignalNo;
++  cf.handle_sigbus = kHandleSignalNo;
++  cf.handle_abort = kHandleSignalNo;
++  cf.handle_sigill = kHandleSignalNo;
++  cf.handle_sigtrap = kHandleSignalNo;
++  cf.handle_sigfpe = kHandleSignalNo;
++  cf.use_sigaltstack = false;
++  cf.hard_rss_limit_mb = 0;
++  cf.soft_rss_limit_mb = 0;
++  cf.malloc_context_size = 1;
++  cf.compress_stack_depot = 0;
++  cf.print_module_map = 0;
++  cf.decorate_proc_maps = false;
++  cf.abort_on_error = true;
++}
++
++}  // namespace __sanitizer
++
++#endif  // SANITIZER_SEALED_FLAGS_H
+-- 
+2.39.5
