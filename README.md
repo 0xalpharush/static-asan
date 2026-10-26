@@ -266,6 +266,7 @@ through the same interceptor as before.
 | `compiler-rt/0021` | Makes lld extract the real libc function at parse time, so that a weakly referenced function is not left null. |
 | `compiler-rt/0022` | Sealed: repairs the arena reservation after a refused commit, and returns the program's NULL. |
 | `compiler-rt/0023` | Sealed: the throwing forms of `operator new` throw `std::bad_alloc` when the allocation is refused. |
+| `compiler-rt/0024` | Sealed: `operator new` runs the `std::new_handler` retry contract on a refused allocation instead of throwing `bad_alloc` on the first failure. |
 
 ## Known limitation: the sealed runtime spins when it cannot get memory
 
