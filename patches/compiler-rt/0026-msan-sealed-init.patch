@@ -1,0 +1,58 @@
+From 38e10e57f31bfdd40ac4c5cb6fdf1f464cab58e5 Mon Sep 17 00:00:00 2001
+From: 0xalpharush <0xalpharush@protonmail.com>
+Date: Mon, 26 Oct 2026 12:05:00 +0000
+Subject: [PATCH] [compiler-rt] sealed init: record __msan_init's frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The sealed static runtime describes the main thread's stack from a frame it
+records on the way in, instead of reading /proc/self/maps for it.  __asan_init
+records that frame in AsanInitInternal, right after SanitizerToolName;
+__msan_init never did, so in a sealed MSan link sealed_init_frame stayed 0.
+
+What that costs: GetThreadStackTopAndBottom reads sealed_init_frame as the top
+of the sealed main-thread stack window; with it 0 the window top falls back to
+the frame of the reader, which is below SetThreadStackAndTls's frame, and
+CHECK(AddrIsInStack(&local)) in msan_thread.cpp fails on the runs where the
+reader's frame lands low enough.  The maintainers measured it: 5 of 80 sealed
+runs failed that CHECK without this, 0 of 80 with it.
+
+Taken at the top of __msan_init, above every frame that will be compared
+against it, with a local whose address is the bound.  Mirrors __asan_init; a
+store of a constant in an unsealed run, so an ordinary MSan build is unchanged.
+---
+ compiler-rt/lib/msan/msan.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
+index b34d3d5..ca86454 100644
+--- a/compiler-rt/lib/msan/msan.cpp
++++ b/compiler-rt/lib/msan/msan.cpp
+@@ -25,6 +25,7 @@
+ #include "sanitizer_common/sanitizer_interface_internal.h"
+ #include "sanitizer_common/sanitizer_libc.h"
+ #include "sanitizer_common/sanitizer_procmaps.h"
++#include "sanitizer_common/sanitizer_sealed.h"
+ #include "sanitizer_common/sanitizer_stackdepot.h"
+ #include "sanitizer_common/sanitizer_stacktrace.h"
+ #include "sanitizer_common/sanitizer_symbolizer.h"
+@@ -461,6 +462,18 @@ void __msan_init() {
+   msan_init_is_running = 1;
+   SanitizerToolName = "MemorySanitizer";
+ 
++  // Record the frame __msan_init started on, for sealed init, exactly as
++  // AsanInitInternal does right after it sets SanitizerToolName.  Sealed mode
++  // describes the main thread's stack from a recorded frame rather than reading
++  // /proc/self/maps for it (see sanitizer_sealed.h): the window ends at this
++  // frame.  Its top is what MsanThread::Init checks the stack against -- without
++  // this, sealed_init_frame stays 0, the window top falls back to the frame of
++  // whoever reads it, and CHECK(AddrIsInStack(&local)) in msan_thread.cpp fails
++  // on the runs where that frame sits below the real one.  Taken here, above
++  // every frame compared against it; a store of a constant in an unsealed run.
++  uptr msan_init_frame;
++  SealedSetInitFrame(reinterpret_cast<uptr>(&msan_init_frame));
++
+   AvoidCVE_2016_2143();
+ 
+   CacheBinaryName();

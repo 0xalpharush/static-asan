@@ -1,0 +1,157 @@
+From 962e5a12d2b18f2180bc7c32e7e86582886bc30f Mon Sep 17 00:00:00 2001
+From: 0xalpharush <0xalpharush@protonmail.com>
+Date: Mon, 26 Oct 2026 12:00:00 +0000
+Subject: [PATCH] [compiler-rt] msan: attach interceptors at link time like
+ asan
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: The static-interception machinery (patches 0001 and 0002) is wired for asan
+only.  COMPILER_RT_STATIC_INTERCEPTION makes a sanitizer's interceptors
+__wrap_<func>, reached through __real_<func>, so a fully static musl link can
+attach them with ld --wrap instead of the dlsym interception that needs a
+dynamic loader; lib/asan/CMakeLists.txt appends SANITIZER_STATIC_INTERCEPTION=1
+to asan's definitions and calls add_sanitizer_rt_wrap_list for clang_rt.asan,
+and asan_rtl.cpp references __asan_wrap_list_present so a link that forgets the
+response file fails rather than producing a binary with every interceptor
+silently detached.  msan got none of this, so libclang_rt.msan.a -- which the
+build already produces on the arches compiler-rt supports msan on -- carried
+dlsym-based interceptors that do nothing in a static binary and had no wrap
+list to link against.  A static-musl msan link therefore could not attach a
+single interceptor.
+
+This gives msan the same three pieces:
+
+  - lib/msan/CMakeLists.txt appends -DSANITIZER_STATIC_INTERCEPTION=1 to
+    MSAN_RTL_CFLAGS under COMPILER_RT_STATIC_INTERCEPTION.  asan carries the
+    define in a DEFS list; msan passes no DEFS, so it rides the one cflags list
+    every msan object is built with, which compiles msan_interceptors.cpp and
+    the common interceptor .inc it includes.  It also calls
+    add_sanitizer_rt_wrap_list(clang_rt.msan), installed as
+    libclang_rt.msan.a.wrap.
+
+  - gen_wrap_list.py names the present-symbol after the archive it reads rather
+    than hardcoding asan's, so clang_rt.msan's list defines
+    __msan_wrap_list_present and clang_rt.asan's still defines
+    __asan_wrap_list_present.  One runtime's wrap file can no longer stand in
+    for another's.
+
+  - msan.cpp references __msan_wrap_list_present under
+    SANITIZER_STATIC_INTERCEPTION, so a static-intercepting msan link without
+    the response file is an undefined symbol at link time, exactly as it is for
+    asan.
+
+Nothing changes for a non-static-interception build: the define is absent, the
+reference compiles out, and the wrap-list target is not created.
+---
+ compiler-rt/lib/msan/CMakeLists.txt           | 19 +++++++++++++++++++
+ compiler-rt/lib/msan/msan.cpp                 | 14 ++++++++++++++
+ .../sanitizer_common/scripts/gen_wrap_list.py | 19 ++++++++++++++++---
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/compiler-rt/lib/msan/CMakeLists.txt b/compiler-rt/lib/msan/CMakeLists.txt
+index a0b9c61..ce44b16 100644
+--- a/compiler-rt/lib/msan/CMakeLists.txt
++++ b/compiler-rt/lib/msan/CMakeLists.txt
+@@ -42,6 +42,15 @@ endif()
+ # Prevent clang from generating libc calls.
+ append_list_if(COMPILER_RT_HAS_FFREESTANDING_FLAG -ffreestanding MSAN_RTL_CFLAGS)
+ 
++# Link-time interception applies to the static runtime, exactly as it does for
++# asan (lib/asan/CMakeLists.txt): COMPILER_RT_STATIC_INTERCEPTION makes the
++# interceptors __wrap_<func> reached through __real_<func>, so a fully static
++# musl link can attach them with ld --wrap.  asan carries the define in its DEFS
++# list; msan passes no DEFS, so it goes on the one cflags list every msan object
++# is built with, which is what compiles msan_interceptors.cpp and the common
++# interceptor .inc it includes.
++append_list_if(COMPILER_RT_STATIC_INTERCEPTION -DSANITIZER_STATIC_INTERCEPTION=1 MSAN_RTL_CFLAGS)
++
+ set(MSAN_RUNTIME_LIBRARIES)
+ 
+ # Static runtime library.
+@@ -81,6 +90,16 @@ foreach(arch ${MSAN_SUPPORTED_ARCH})
+     add_dependencies(msan clang_rt.msan-${arch}-symbols
+                           clang_rt.msan_cxx-${arch}-symbols)
+   endif()
++
++  # The response file of --wrap options a static link against this runtime must
++  # pass, installed next to the archive as libclang_rt.msan.a.wrap.  Mirrors the
++  # call lib/asan/CMakeLists.txt makes for clang_rt.asan; gen_wrap_list.py names
++  # the present-symbol after the archive, so msan's is __msan_wrap_list_present.
++  if(COMPILER_RT_STATIC_INTERCEPTION)
++    add_sanitizer_rt_wrap_list(clang_rt.msan
++      ARCHS ${arch}
++      PARENT_TARGET msan)
++  endif()
+ endforeach()
+ 
+ add_compiler_rt_resource_file(msan_ignorelist msan_ignorelist.txt msan)
+diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
+index 6c27ab2..b34d3d5 100644
+--- a/compiler-rt/lib/msan/msan.cpp
++++ b/compiler-rt/lib/msan/msan.cpp
+@@ -35,6 +35,20 @@
+ 
+ using namespace __sanitizer;
+ 
++#if SANITIZER_STATIC_INTERCEPTION
++// The interceptors of a statically intercepting runtime are attached by the
++// link: they are named __wrap_<func> and are reached only if the link passes
++// --wrap=<func> for each, which it does with the response file installed next to
++// this archive (libclang_rt.msan.a.wrap).  Leaving the response file out is not
++// a link error and not a run-time error either -- the program contains the
++// runtime, initializes it, and is instrumented, with every interceptor detached
++// and no diagnostic anywhere.  The response file defines this symbol, so that
++// leaving it out is an undefined symbol at link time instead.  Mirrors
++// asan_rtl.cpp's __asan_wrap_list_present.
++extern "C" char __msan_wrap_list_present;
++static char *const kMsanWrapListPresent USED = &__msan_wrap_list_present;
++#endif
++
+ // Globals.
+ static THREADLOCAL int msan_expect_umr = 0;
+ static THREADLOCAL int msan_expected_umr_found = 0;
+diff --git a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+index 9fd0ebf..1a91e49 100755
+--- a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
++++ b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
+@@ -33,14 +33,27 @@
+ #
+ # ===------------------------------------------------------------------------===#
+ import argparse
++import os
++import re
+ import subprocess
+ import sys
+ 
+ PREFIX = "__wrap_"
+ 
++
+ # Defined by the response file and referenced by the runtime, so that a link
+-# without the response file fails instead of detaching every interceptor.
+-PRESENT_SYMBOL = "__asan_wrap_list_present"
++# without the response file fails instead of detaching every interceptor.  It is
++# named after the runtime the list is for -- __asan_wrap_list_present for
++# libclang_rt.asan.a, __msan_wrap_list_present for libclang_rt.msan.a -- so one
++# runtime's wrap file cannot stand in for another's, and so the symbol each
++# runtime references is the one its own list defines.  asan is unchanged: its
++# archive still yields __asan_wrap_list_present.
++def present_symbol(library):
++    base = os.path.basename(library)
++    m = re.match(r"libclang_rt\.([a-z0-9]+)", base)
++    if not m:
++        raise RuntimeError("cannot derive a sanitizer name from %s" % base)
++    return "__%s_wrap_list_present" % m.group(1)
+ 
+ # A floor on how much of the runtime's interception survives intersecting it with
+ # --available.  The libraries named there are meant to be the ones the link will
+@@ -111,7 +124,7 @@ def main():
+         return 1
+ 
+     with open(args.output, "w") as f:
+-        f.write("--defsym=%s=1\n" % PRESENT_SYMBOL)
++        f.write("--defsym=%s=1\n" % present_symbol(args.library))
+         for name in sorted(names):
+             f.write("--wrap=%s\n" % name)
+     return 0

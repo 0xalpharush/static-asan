@@ -25,11 +25,14 @@ This is asan-static commit `385966a2672b4be07efec847baee1dd5e497b25f`, the toolc
 binaries in Theorem Labs' OSS-Fuzz proofs: asan-static `a408805db578be529ff2923ddee5a608ba9753d2`
 plus musl patch 0003, which keeps a static program's TLS block in `.bss` and replaces musl
 patch 0002. It is a fresh snapshot of that commit's `toolchain/` and `patches/`, without
-asan-static's history.
+asan-static's history, plus five compiler-rt patches (`0024`–`0028`) that add
+MemorySanitizer support to the sealed static toolchain and are not part of asan-static
+`385966a2`; they are described below and in the patch table.
 
-The snapshot differs from asan-static in three ways:
+The snapshot differs from asan-static in four ways:
 
-- The `From:` line of each patch names Theorem Labs.
+- The `From:` line of each patch names Theorem Labs, except the five MSan patches
+  `0024`–`0028`.
 - Internal references removed from commit messages and from source comments. The
   comment edits keep the number of lines the same, so no line number in the patched
   sources moves.
@@ -38,10 +41,19 @@ The snapshot differs from asan-static in three ways:
   2026-10-25 the packages it fetches for the target architecture (section 0a of the
   Dockerfile) also accept any Alpine build number of their pinned version, because
   Alpine replaced `musl-1.2.5-r12` with `r13` and the exact pin stopped the build.
+- Five compiler-rt patches, `0024`–`0028`, add MemorySanitizer support: link-time interception
+  and a wrap list for `libclang_rt.msan.a`, the musl `rlimit64` and `FILE` fixes MSan
+  needs, and a sealed start-up for MSan. They change only the MSan runtime
+  (`compiler-rt/lib/msan/*`) and the `gen_wrap_list.py` build script, whose output for
+  ASan is byte-identical. No shared runtime source is touched —
+  `sanitizer_platform_limits_posix.h` in particular is unchanged — so the ASan, TSan,
+  HWASan and UBSan archives, and the md5 below, do not move. `toolchain/Dockerfile`
+  also builds the MSan configs and a smoke test for them (sections 5b and 6).
 
-Both patch series apply with `patch -p1 --fuzz=0` to the pinned bases. The source
-trees that result from the two series differ in six comment lines of two files, and in
-nothing else: five in `compiler-rt/lib/asan/asan_new_delete.cpp` (patch 0023) and one in
+Both patch series apply with `patch -p1 --fuzz=0` to the pinned bases. Excluding the
+five MSan patches, which asan-static does not carry, the source trees that result from
+the two series differ in six comment lines of two files, and in nothing else: five in
+`compiler-rt/lib/asan/asan_new_delete.cpp` (patch 0023) and one in
 `compiler-rt/lib/sanitizer_common/sanitizer_sealed.h` (patch 0019).
 
 The builds of a408805d identified the toolchain by a hash over `toolchain/` and
@@ -266,6 +278,11 @@ through the same interceptor as before.
 | `compiler-rt/0021` | Makes lld extract the real libc function at parse time, so that a weakly referenced function is not left null. |
 | `compiler-rt/0022` | Sealed: repairs the arena reservation after a refused commit, and returns the program's NULL. |
 | `compiler-rt/0023` | Sealed: the throwing forms of `operator new` throw `std::bad_alloc` when the allocation is refused. |
+| `compiler-rt/0024` | Gives MSan the same link-time interception asan has: `SANITIZER_STATIC_INTERCEPTION` for msan's cflags, a `clang_rt.msan` wrap list, and a per-runtime present-symbol in `gen_wrap_list.py` (`__msan_wrap_list_present`), so a static-musl MSan link attaches its interceptors with `ld --wrap`. |
+| `compiler-rt/0025` | On musl, reads the `getrlimit64`/`prlimit64` result through `struct_rlimit_sz` (musl's `rlimit64` is `rlimit`) instead of the glibc-only `struct_rlimit64_sz`, whose undefined symbol otherwise fails every static-musl MSan link. |
+| `compiler-rt/0026` | Sealed: `__msan_init` records its frame like `__asan_init`. On x86_64/aarch64 this sets the top of the sealed main-thread stack window that `MsanThread::Init`'s `CHECK(AddrIsInStack())` reads; without it that check fails on some runs. |
+| `compiler-rt/0027` | Sealed: gives MSan a sealed start-up — reserves its shadow/origin/invalid ranges with `MAP_FIXED_NOREPLACE` and spins on refusal (like asan's `SealedReserveShadow`), pins the `handle_*`/`use_sigaltstack`/`abort_on_error` flags (a `SealFlags` equivalent), and makes `ReExec` unreachable. |
+| `compiler-rt/0028` | MSan-only: turns `SANITIZER_HAS_STRUCT_FILE` off under `SANITIZER_MUSL` inside `msan_interceptors.cpp` (not the shared header), so `unpoison_file` is a no-op on musl without rebuilding any other runtime. |
 
 ## Known limitation: the sealed runtime spins when it cannot get memory
 
