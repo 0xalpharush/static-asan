@@ -37,13 +37,13 @@ without the entry, finished with it.
  3 files changed, 41 insertions(+), 9 deletions(-)
 
 diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
-index c7bbc66a4..a2b37c8d7 100644
+index 7b8bbce14..6937fbb93 100644
 --- a/compiler-rt/lib/asan/asan_flags.cpp
 +++ b/compiler-rt/lib/asan/asan_flags.cpp
-@@ -284,6 +284,19 @@ static void SealFlags() {
-   cf.heap_profile = false;
-   cf.allocator_release_to_os_interval_ms = -1;
-   cf.abort_on_error = true;
+@@ -299,6 +299,19 @@ static void SealFlags() {
+   cf.compress_stack_depot = 0;
+   cf.print_module_map = 0;
+   cf.decorate_proc_maps = false;
 +  // The shadow is zeroed with memset and never re-mapped.  Above this
 +  // threshold FastPoisonShadow zero-fills a shadow range by mapping fresh
 +  // pages over it with MAP_FIXED instead of writing zeros, on every large

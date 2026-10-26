@@ -193,8 +193,28 @@ report and everything after it may do whatever they do: a run that reports has
 already left the behaviour the caller reasons about, and giving that path a
 quiet mode would remove the signal rather than the syscall.  Sealing is about
 start-up and teardown, which happen on every input.
+
+SealFlags() pins four more flags, each a way for a healthy run's behaviour to
+depend on something other than the program and its input.  malloc_context_size
+is 1: at its default of 30, every malloc and free walks up to 30 frames of the
+caller's frame-pointer chain and stores the trace in the stack depot, so the
+depot grows with the number of distinct call paths and depends on what the
+stack holds.  At 1 the allocator records only the pc of the call, with no
+walk, and the depot holds one trace per allocation site.  compress_stack_depot
+is 0, so the depot never starts its compression thread (a clone).
+print_module_map is 0 and decorate_proc_maps is false: the first reads
+/proc/self/maps and the second names mappings with prctl.  A report loses its
+allocation and free stacks beyond the first frame; a sealed binary that reports
+has already left the behaviour this mode is for.  Like the other pins, these
+are applied after __asan_default_options() is parsed, so a hook cannot unpin
+them.
+
+cf is declared [[clang::uninitialized]]: CopyFrom() overwrites all of it, so
+the pattern fill -ftrivial-auto-var-init would emit first is dead.  Leaving it
+out pays for the four stores, so InitializeFlags() keeps its size and no other
+code in a linked binary moves.
 ---
- compiler-rt/lib/asan/asan_flags.cpp                   |  76 ++++++++++++++++++++++++++++++
+ compiler-rt/lib/asan/asan_flags.cpp                   |  91 ++++++++++++++++++++++++++++++
  compiler-rt/lib/asan/asan_linux.cpp                   |  24 ++++++++++++++++++++++++
  compiler-rt/lib/asan/asan_posix.cpp                   |   9 +++++++++
  compiler-rt/lib/asan/asan_rtl.cpp                     |  80 +++++++++++++++++++++++++++---
@@ -204,7 +224,7 @@ start-up and teardown, which happen on every input.
  .../sanitizer_linux_libcdep.cpp                       |  30 ++++++++++++++++++++++++++++++
  compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp  |  13 +++++++++++++
  compiler-rt/lib/sanitizer_common/sanitizer_sealed.h   | 156 ++++++++++++++++++++++++++++++
- 10 files changed, 454 insertions(+), 8 deletions(-)
+ 10 files changed, 469 insertions(+), 8 deletions(-)
  create mode 100644 compiler-rt/lib/sanitizer_common/sanitizer_sealed.h
 
 diff --git a/compiler-rt/lib/asan/asan_flags.cpp b/compiler-rt/lib/asan/asan_flags.cpp
@@ -219,7 +239,7 @@ index 9cfb70b..bdaa5d8 100644
  #include "sanitizer_common/sanitizer_win_interception.h"
  #include "ubsan/ubsan_flags.h"
  #include "ubsan/ubsan_platform.h"
-@@ -212,9 +213,84 @@ static void ProcessFlags() {
+@@ -212,9 +213,99 @@ static void ProcessFlags() {
    }
  }
  
@@ -278,7 +298,10 @@ index 9cfb70b..bdaa5d8 100644
 +static void SealFlags() {
 +  if (!SealedInit())
 +    return;
-+  CommonFlags cf;
++  // CopyFrom overwrites all of cf, so the pattern fill that
++  // -ftrivial-auto-var-init would emit first is dead; leaving it out pays
++  // for the pins below without growing InitializeFlags (see below).
++  [[clang::uninitialized]] CommonFlags cf;
 +  cf.CopyFrom(*common_flags());
 +  cf.handle_segv = kHandleSignalNo;
 +  cf.handle_sigbus = kHandleSignalNo;
@@ -294,6 +317,18 @@ index 9cfb70b..bdaa5d8 100644
 +  cf.heap_profile = false;
 +  cf.allocator_release_to_os_interval_ms = -1;
 +  cf.abort_on_error = true;
++  // One frame per allocation and free: the stack depot then stores one
++  // trace per allocation site, not one per distinct call path, so it does
++  // not grow with the workload.  The depot's background compression
++  // thread (a clone) stays off.  Printing the module map reads
++  // /proc/self/maps, and decorate_proc_maps names mappings with prctl;
++  // both are syscalls a hook could otherwise turn on.  With the pattern
++  // fill above gone, these four stores leave InitializeFlags at its old
++  // size, so no other code in a linked binary moves.
++  cf.malloc_context_size = 1;
++  cf.compress_stack_depot = 0;
++  cf.print_module_map = 0;
++  cf.decorate_proc_maps = false;
 +  OverrideCommonFlags(cf);
 +}
 +
