@@ -38,8 +38,11 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# A pull request's newer run replaces its older one.  Every other run has a group of
+# its own: a push's route diffs against the push before it, so a cancelled push run
+# would leave a change that no run built.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 defaults:
   run:
@@ -88,7 +91,7 @@ jobs:
                 *.md | LICENSE* | .gitignore) echo "documentation: $f" ;;
                 *) echo "builds: $f"; build=true ;;
               esac
-            done < <(git diff --name-only "$base" HEAD)
+            done < <(git diff --no-renames --name-only "$base" HEAD)
           fi
           echo "build=$build" | tee -a "$GITHUB_OUTPUT"
 
