@@ -480,8 +480,8 @@ RUN cmake -S /llvm-project/runtimes -B /build/libcxx -G Ninja \
       -DCMAKE_CXX_COMPILER_TARGET="$TRIPLE" \
       -DCMAKE_ASM_COMPILER_TARGET="$TRIPLE" \
       -DCMAKE_SYSROOT="$SYSROOT" \
-      -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections $TARGET_CFLAGS" \
-      -DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections $TARGET_CFLAGS" \
+      -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections -isystem /llvm-project/compiler-rt/include $TARGET_CFLAGS" \
+      -DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections -isystem /llvm-project/compiler-rt/include $TARGET_CFLAGS" \
       -DCMAKE_ASM_FLAGS="$TARGET_CFLAGS" \
       -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
       -DLIBUNWIND_ENABLE_SHARED=OFF \
