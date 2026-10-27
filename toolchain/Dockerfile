@@ -41,9 +41,10 @@
 # 128GB, so the two verification steps below that run an ASan binary (the
 # interceptor check and the std::string check) need a container whose RLIMIT_AS
 # is not small.  The others do not: the plain static musl link runs, the link
-# that must fail still fails, and riscv64 has no MSan step.  A 32-bit target needs
-# none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
-# section of README.md.
+# that must fail still fails, and the MSan step runs but skips, printing "no msan
+# test", because riscv64 has no msan runtime and so no MSan config.  A 32-bit
+# target needs none of that -- its shadow is about 512MiB.  See the "Running an
+# emulated image" section of README.md.
 #
 # Six of the steps at the end run binaries for the target; one of them, the
 # MemorySanitizer test, only on x86_64 and aarch64, the targets with an msan

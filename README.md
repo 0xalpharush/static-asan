@@ -263,8 +263,9 @@ another dynamic type ends as a trap-mode check does. Before it reads the vtable,
 information and the base-class lists, it checks that each address lies inside the program's
 image, and treats one outside it as a mismatch; it makes no syscall for this. It does not check
 the object's own storage, which compiler-rt does not check either. Its search of the base
-classes goes at most 512 levels deep and visits at most 2^20 base classes in all (a class that
-occurs more than once is counted each time); a search that reaches
+classes goes at most 512 levels deep and visits at most 2^20 − 1 base classes in all (2^20
+classes counting the one it starts from; a class that occurs more than once is counted each
+time); a search that reaches
 either limit is a mismatch and traps, even in a correct program, and the source comment says
 which programs that can be. Code compiled with `-fno-rtti` gets no vptr check.
 clang reads a config's options before the command line, so a command line that adds
@@ -285,7 +286,8 @@ pinned to `$BUILDPLATFORM`, and the three arguments above name the target. You d
 need target hardware or an emulator to build the image.
 
 Six verification steps at the end of the Dockerfile run target binaries; one of them,
-the MemorySanitizer check, exists only on x86_64 and aarch64. On a cross build, the
+the MemorySanitizer check, runs them only on x86_64 and aarch64, and on riscv64 and armv7,
+which have no MSan config, it skips and prints "no msan test". On a cross build, the
 build machine must be able to run them. On Linux, register `qemu-user` with
 `binfmt_misc` for the target, for example with the `qemu-user-static` package or with
 `docker run --privileged tonistiigi/binfmt --install <arch>`. Only these six steps
