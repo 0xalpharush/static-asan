@@ -38,9 +38,10 @@
 # in section 3, which name architectures rather than being chosen per architecture,
 # and are explained there.  The one other thing that is not portable is not in this
 # file: ASan on riscv64 takes the dynamic-shadow path and its allocator reserves
-# 128GB, so the one verification step below that runs an ASan binary needs a
-# container whose RLIMIT_AS is not small.  The other two do not: the plain static
-# musl link runs and the link that must fail still fails.  A 32-bit target needs
+# 128GB, so the two verification steps below that run an ASan binary (the
+# interceptor check and the std::string check) need a container whose RLIMIT_AS
+# is not small.  The others do not: the plain static musl link runs, the link
+# that must fail still fails, and riscv64 has no MSan step.  A 32-bit target needs
 # none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
 # section of README.md.
 #
