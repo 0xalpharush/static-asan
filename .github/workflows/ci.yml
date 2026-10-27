@@ -3,11 +3,17 @@
 # Each job builds toolchain/Dockerfile for one target, as README.md's "Building"
 # says, from the pinned musl and llvm-project commits.  The Dockerfile's own last
 # steps are the tests: a static musl binary runs, a static ASan binary reports an
-# overflow that only a live interceptor can report, and a link without the wrap
-# list fails (section 6 of the Dockerfile).  The cross targets run those steps
-# under qemu-user.  After the build, one more step links hello world with
-# asan-musl.cfg and requires that the binary has no PT_INTERP, no DT_NEEDED and no
-# dynamic symbol table.
+# overflow that only a live interceptor can report, a link without the wrap list
+# fails, and on x86_64 and aarch64 the static MSan binaries, plain and sealed, run
+# and report (section 6 of the Dockerfile).  x86_64 and aarch64 each build on a
+# runner of their own architecture, so those steps run natively: MSan cannot run
+# under qemu-user, and an emulated MSan step fails the build under the default
+# VERIFY_RUNTIME=require.  riscv64 and armv7 are cross-built on x86_64
+# and run their steps under qemu-user; they have no MSan runtime.  After the
+# build, one step links hello world with asan-musl.cfg and requires that the
+# binary has no PT_INTERP, no DT_NEEDED and no dynamic symbol table, and another
+# requires that the image records nothing as unverified
+# (/opt/asan-static/RUNTIME-UNVERIFIED), so that no check was skipped.
 #
 # riscv64 is built with the arguments of the OSS-Fuzz proofs' toolchain (README.md,
 # "Building"), except VERIFY_RUNTIME, which stays at its default, "require".
@@ -149,28 +155,33 @@ jobs:
   toolchain:
     needs: sources
     name: toolchain (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            runner: ubuntu-24.04
             triple: x86_64-unknown-linux-musl
             musl_target: x86_64-linux-musl
             qemu: ""
             target_cflags: ""
+          # Native, not qemu-user: the MSan step has to run on the hardware it is for.
           - arch: aarch64
+            runner: ubuntu-24.04-arm
             triple: aarch64-unknown-linux-musl
             musl_target: aarch64-linux-musl
-            qemu: arm64
+            qemu: ""
             target_cflags: ""
           - arch: riscv64
+            runner: ubuntu-24.04
             triple: riscv64-unknown-linux-musl
             musl_target: riscv64-linux-musl
             qemu: riscv64
             target_cflags: "-march=rv64g -mabi=lp64d -ffunction-sections -fdata-sections"
           - arch: armv7
+            runner: ubuntu-24.04
             triple: armv7-unknown-linux-musleabihf
             musl_target: armv7-linux-musleabihf
             qemu: arm
@@ -237,6 +248,19 @@ jobs:
           ! grep -q . "$dir/dynsyms" || { echo "::error::the binary has a dynamic symbol table"; cat "$dir/dynsyms"; exit 1; }
           grep -q __asan_init <(readelf -sW "$dir/hello") || { echo "::error::the binary has no ASan runtime"; exit 1; }
           echo "no PT_INTERP, no DT_NEEDED, no dynamic symbol table; ASan runtime linked"
+
+      - name: the image records no unverified runtime
+        # VERIFY_RUNTIME stays "require" here, so every deferral -- a constrained
+        # address space, or an MSan step that found itself under emulation --
+        # already fails the build.  This holds the image to that: nothing in it
+        # may say that a check did not run.
+        run: |
+          set -euo pipefail
+          if docker run --rm tc-asan-musl:ci cat /opt/asan-static/RUNTIME-UNVERIFIED; then
+            echo "::error::the image records a runtime check as not verified (above)"
+            exit 1
+          fi
+          echo "no RUNTIME-UNVERIFIED in the image"
 
   # The one check to require.  It runs whatever happened above: it passes when the
   # route job chose the jobs and each chosen job passed, and fails otherwise.
