@@ -104,7 +104,9 @@ gives the same `libclang_rt.asan.a`, md5 `91ba024da5ddacd96dc1c7588e5763b3`, and
 this repository gives the same `4880198ff493a316727c4cc1d4f78e21` as at a408805d. Against
 the asan-static 385966a2 build, this repository's musl sysroot (`libc.a`, the start-up
 objects, libunwind, libc++ and libc++abi: 21 files) is byte-identical, and the runtime
-archives differ only in `.debug_line`, as above.
+archives differ only in `.debug_line`, as above. The sysroot also holds a second libc++
+and libc++abi, built with ASan, in `usr/lib/asan-libcxx`. asan-static 385966a2 has no
+counterpart to it; only the static ASan configs use it (see "Using the image").
 
 The Alpine packages these builds installed are the ones the `~series` pins resolved to
 on the day of the build (see "Pinned versions").
@@ -215,17 +217,32 @@ runtime archive and wrap list as `msan-musl.cfg` and adds one `--defsym`. The MS
 configs exist only on the targets for which compiler-rt 20.1.8 builds an MSan
 runtime.
 
+`asan-musl.cfg`, `asan-musl-sealed.cfg` and `asan-musl-silent.cfg` compile and link C++
+against a second libc++ and libc++abi, built with ASan, in
+`/opt/musl-sysroot/usr/lib/asan-libcxx`. Its `__config_site` sets
+`_LIBCPP_INSTRUMENTED_WITH_ASAN` to 1, so `std::string` reports `container-overflow` for an
+access past `size()` and within `capacity()`, as `std::vector` already does. Every other
+config, and every C program, uses the default copy and links as before; of the ASan
+builds, only C++ programs that use libc++ change.
+
+With that copy, every translation unit in an ASan link that uses `std::string`,
+`std::vector` or `std::deque` must be compiled with `-fsanitize=address`. A unit compiled
+without it, or a prebuilt object, does not update the annotations, and correct code can
+then report `container-overflow`. To turn the check off, set `detect_container_overflow=0`:
+in `ASAN_OPTIONS` for `asan-musl.cfg`, and in the program's own
+`__asan_default_options()` for a sealed binary, which reads no environment (patch 0012).
+
 ## Cross-building
 
 The image runs on the build machine and compiles for the target. The base image is
 pinned to `$BUILDPLATFORM`, and the three arguments above name the target. You do not
 need target hardware or an emulator to build the image.
 
-Four verification steps at the end of the Dockerfile run target binaries; the fourth,
+Five verification steps at the end of the Dockerfile run target binaries; the fifth,
 the MemorySanitizer check, exists only on x86_64 and aarch64. On a cross build, the
 build machine must be able to run them. On Linux, register `qemu-user` with
 `binfmt_misc` for the target, for example with the `qemu-user-static` package or with
-`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these four steps
+`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these five steps
 need the emulator. The MSan check detects the emulator and does not run its binaries
 under it. With the default `VERIFY_RUNTIME=require` that fails the build; with
 `VERIFY_RUNTIME=defer` the check records them in

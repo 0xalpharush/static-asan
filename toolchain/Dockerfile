@@ -44,12 +44,12 @@
 # none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
 # section of README.md.
 #
-# The four steps at the end run binaries for the target; the fourth, the
+# The five steps at the end run binaries for the target; the fifth, the
 # MemorySanitizer test, only on x86_64 and aarch64, the targets with an msan
 # runtime.  On a native build that is nothing to arrange; on a cross build the
 # machine has to be able to execute them, which on Linux means binfmt_misc with
 # qemu-user registered -- `docker run --privileged tonistiigi/binfmt --install
-# <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these four
+# <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these five
 # steps need it.  Nothing the image is for does.  MSan cannot run under
 # qemu-user at all (qemu places the guest stack inside MSan's fixed ranges), so
 # the MSan step detects emulation and does not run its binaries; it treats that
@@ -67,6 +67,8 @@
 # Produces:
 #   /opt/musl-sysroot                  musl 1.2.6 sysroot (headers, crt*, libc.a/so)
 #                                      + kernel uapi headers + LLVM libunwind.a
+#   /opt/musl-sysroot/usr/lib/asan-libcxx  a second libc++ / libc++abi, built
+#                                      with ASan, for the static ASan configs
 #   /opt/asan-rt/lib/clang/20          stock compiler-rt: dlsym interception,
 #                                      what a dynamic link uses
 #   /opt/asan-static-rt/lib/clang/20   compiler-rt with COMPILER_RT_STATIC_INTERCEPTION:
@@ -136,6 +138,7 @@ ARG APK_ARCH=aarch64
 ARG SYSROOT=/opt/musl-sysroot
 ARG RESOURCE_DIR=/opt/asan-rt/lib/clang/20
 ARG STATIC_RESOURCE_DIR=/opt/asan-static-rt/lib/clang/20
+ARG ASAN_LIBCXX=$SYSROOT/usr/lib/asan-libcxx
 
 # Extra target flags threaded through every component that ends up inside a link
 # this image makes: musl, libunwind, both compiler-rt builds, and the six config
@@ -746,6 +749,84 @@ RUN set -eu; \
     rm -v "$rtdir"/libclang_rt.*.syms
 
 # ---------------------------------------------------------------------------
+# 4b. LLVM libc++ / libc++abi again, built with ASan -> $ASAN_LIBCXX
+#
+# libc++ annotates std::string for AddressSanitizer only when libc++ itself was
+# built with ASan.  Every annotation in <string> is guarded by
+# _LIBCPP_INSTRUMENTED_WITH_ASAN, and libcxx/CMakeLists.txt defines that macro to
+# 1 in __config_site only when LLVM_USE_SANITIZER contains "Address".  Section
+# 2b builds without it, so with 2b's copy an ASan build reports nothing for a
+# read or write past size() and within capacity() of a std::string, while it
+# does report the same access on a std::vector, whose annotations need no
+# instrumented library.
+#
+# Section 2b's copy is the one every configuration links, the plain and UBSan
+# ones included, so it stays as it is.  This is a second copy, built with
+# -DLLVM_USE_SANITIZER=Address and installed under its own prefix with its own
+# __config_site.  Only asan-musl.cfg, asan-musl-sealed.cfg and
+# asan-musl-silent.cfg use it (section 5): its headers replace the default C++
+# headers (-stdlib++-isystem), and its library directory comes before
+# $SYSROOT/usr/lib.  A C compile does not use the C++ headers and a C link takes
+# nothing from that directory, so C ASan binaries and every non-ASan build are
+# unchanged.
+#
+# The CMake flags are section 2b's, with three differences: the sanitizer, the
+# install prefix, and -isystem /llvm-project/compiler-rt/include.  libunwind is
+# still named in LLVM_ENABLE_RUNTIMES, because LIBCXXABI_USE_LLVM_UNWINDER=ON is
+# a hard CMake error without it (2b), and keeping that setting gives libc++abi
+# the same <unwind.h> as 2b's copy.  The build then compiles libunwind too, with
+# ASan, and libunwind.cpp includes <sanitizer/asan_interface.h>; the in-tree
+# compiler-rt headers are what it finds.  Only install-cxx and install-cxxabi
+# run, so that instrumented libunwind is never installed, and an ASan link keeps
+# section 2's libunwind.a, which is also what ASan's own unwinding goes through.
+#
+# Every translation unit in an ASan link that uses std::string, std::vector or
+# std::deque must then be built with -fsanitize=address: one built without it
+# does not update the annotations, and correct code can report
+# container-overflow (README.md, "Using the image").
+# ---------------------------------------------------------------------------
+RUN cmake -S /llvm-project/runtimes -B /build/asan-libcxx -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_RUNTIMES="libunwind;libcxxabi;libcxx" \
+      -DLLVM_USE_SANITIZER=Address \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang \
+      -DCMAKE_C_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_CXX_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_ASM_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_SYSROOT="$SYSROOT" \
+      -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections -isystem /llvm-project/compiler-rt/include $TARGET_CFLAGS" \
+      -DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections -isystem /llvm-project/compiler-rt/include $TARGET_CFLAGS" \
+      -DCMAKE_ASM_FLAGS="$TARGET_CFLAGS" \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+      -DLIBUNWIND_ENABLE_SHARED=OFF \
+      -DLIBUNWIND_ENABLE_STATIC=ON \
+      -DLIBUNWIND_USE_COMPILER_RT=ON \
+      -DLIBUNWIND_INCLUDE_TESTS=OFF \
+      -DLIBCXX_ENABLE_SHARED=OFF \
+      -DLIBCXX_ENABLE_STATIC=ON \
+      -DLIBCXXABI_ENABLE_SHARED=OFF \
+      -DLIBCXXABI_ENABLE_STATIC=ON \
+      -DLIBCXX_HAS_MUSL_LIBC=ON \
+      -DLIBCXX_USE_COMPILER_RT=ON \
+      -DLIBCXXABI_USE_COMPILER_RT=ON \
+      -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+      -DLIBCXX_CXX_ABI=libcxxabi \
+      -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
+      -DLIBCXX_ENABLE_THREADS=ON \
+      -DLIBCXXABI_ENABLE_THREADS=OFF \
+      -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+      -DLIBCXX_INCLUDE_TESTS=OFF \
+      -DLIBCXXABI_INCLUDE_TESTS=OFF \
+      -DCMAKE_INSTALL_PREFIX="$ASAN_LIBCXX" \
+      -DLIBCXX_INSTALL_LIBRARY_DIR="$ASAN_LIBCXX/lib" \
+      -DLIBCXXABI_INSTALL_LIBRARY_DIR="$ASAN_LIBCXX/lib" \
+      -DLIBCXX_INSTALL_INCLUDE_DIR="$ASAN_LIBCXX/include/c++/v1" \
+      -DLIBCXX_INSTALL_INCLUDE_TARGET_DIR="$ASAN_LIBCXX/include/$TRIPLE/c++/v1" \
+ && ninja -C /build/asan-libcxx -j"$(nproc)" cxx cxxabi \
+ && ninja -C /build/asan-libcxx install-cxx install-cxxabi \
+ && rm -rf /build/asan-libcxx
+
+# ---------------------------------------------------------------------------
 # 5. clang config files
 #
 # Seven of them, each explicitly named on the command line; none is a default
@@ -878,6 +959,9 @@ RUN set -eu; \
       "--sysroot=$SYSROOT" \
       "$TARGET_CFLAGS" \
       "-resource-dir=$STATIC_RESOURCE_DIR" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/$TRIPLE/c++/v1" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/c++/v1" \
+      "-L$ASAN_LIBCXX/lib" \
       "--rtlib=compiler-rt" \
       "--unwindlib=libunwind" \
       "-fuse-ld=lld" \
@@ -963,6 +1047,9 @@ RUN set -eu; \
       "--sysroot=$SYSROOT" \
       "$TARGET_CFLAGS" \
       "-resource-dir=$STATIC_RESOURCE_DIR" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/$TRIPLE/c++/v1" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/c++/v1" \
+      "-L$ASAN_LIBCXX/lib" \
       "--rtlib=compiler-rt" \
       "--unwindlib=libunwind" \
       "-fuse-ld=lld" \
@@ -985,6 +1072,9 @@ RUN set -eu; \
       "--sysroot=$SYSROOT" \
       "$TARGET_CFLAGS" \
       "-resource-dir=$STATIC_RESOURCE_DIR" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/$TRIPLE/c++/v1" \
+      "-stdlib++-isystem$ASAN_LIBCXX/include/c++/v1" \
+      "-L$ASAN_LIBCXX/lib" \
       "--rtlib=compiler-rt" \
       "--unwindlib=libunwind" \
       "-fuse-ld=lld" \
@@ -1199,6 +1289,35 @@ RUN set -eu; \
     fi; \
     grep -q "__asan_wrap_list_present" /tmp/detached.log; \
     echo "a link without the wrap list fails"
+
+# ...and that std::string reports container-overflow in the ASan builds, through
+# the copy in section 4b, and nowhere else.  The macro is 1 in that copy and 0
+# in the default one; a plain C++ program still links against the default copy
+# and runs; a sealed ASan program that reads past size() and within capacity()
+# reports (exit 134); and one that grows, shrinks and copies a string correctly
+# does not.  The two ASan programs run only when the interceptor check above
+# could run its binary.  The sealed runtime does not lower RLIMIT_CORE, as
+# disable_coredump does in the other configs, so the program that reports turns
+# off its own core dump: a core of its address space, shadow included, takes
+# minutes to write and can fill the build host's disk.
+RUN set -eu; \
+    grep -q "^#define _LIBCPP_INSTRUMENTED_WITH_ASAN 1$" "$ASAN_LIBCXX/include/$TRIPLE/c++/v1/__config_site"; \
+    grep -q "^#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0$" "$SYSROOT/usr/include/$TRIPLE/c++/v1/__config_site"; \
+    printf '#include <cstdio>\n#include <string>\nint main(){std::string s("plain");std::printf("%%s\\n",s.c_str());return 0;}\n' > /tmp/plain.cpp; \
+    clang++ --config=/opt/asan-static/musl.cfg -stdlib=libc++ /tmp/plain.cpp -o /tmp/plain-cxx; \
+    [ "$(/tmp/plain-cxx)" = plain ]; \
+    printf '#include <cstdio>\n#include <string>\n#include <sys/prctl.h>\n#include <sys/resource.h>\nint main(){struct rlimit r={0,0};setrlimit(RLIMIT_CORE,&r);prctl(PR_SET_DUMPABLE,0);std::string s;s.reserve(64);s.resize(4,(char)97);volatile char c=s.data()[20];std::printf("%%d\\n",(int)c);return 0;}\n' > /tmp/string-over.cpp; \
+    printf '#include <cstdio>\n#include <string>\nint main(){std::string s("hello");for(int i=0;i<200;i++)s+=(char)(97+i%%26);s.resize(10);s.shrink_to_fit();std::string t=s+s;std::printf("%%zu\\n",t.size());return 0;}\n' > /tmp/string-ok.cpp; \
+    clang++ --config=/opt/asan-static/asan-musl-sealed.cfg -stdlib=libc++ -O1 /tmp/string-over.cpp -o /tmp/string-over; \
+    clang++ --config=/opt/asan-static/asan-musl-sealed.cfg -stdlib=libc++ -O1 /tmp/string-ok.cpp -o /tmp/string-ok; \
+    if [ -e /opt/asan-static/RUNTIME-UNVERIFIED ]; then \
+      echo "std::string container-overflow: built, not run (RUNTIME-UNVERIFIED)"; \
+    else \
+      st=0; /tmp/string-over >/dev/null 2>&1 || st=$?; \
+      [ "$st" = 134 ] || { echo "a std::string read past size() did not report (exit $st)" >&2; exit 1; }; \
+      [ "$(/tmp/string-ok)" = 20 ]; \
+      echo "std::string container-overflow is reported; a correct program does not report"; \
+    fi
 
 # MemorySanitizer test, on the targets that have an msan runtime (x86_64 and
 # aarch64; on the others section 5b wrote no msan config and this step says so
