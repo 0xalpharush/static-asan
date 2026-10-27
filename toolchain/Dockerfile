@@ -157,8 +157,10 @@ ARG HARDENED_LIBCXX=$SYSROOT/usr/lib/hardened-libcxx
 ARG VPTR_TRAP=/opt/ubsan-vptr-trap
 
 # Extra target flags threaded through every component that ends up inside a link
-# this image makes: musl, libunwind, both compiler-rt builds, and the six config
-# files.  Empty by default, so an image built without it is the stock one.
+# this image makes: musl, libunwind, the three libc++ builds, both compiler-rt
+# builds, the vptr handler, and the config files (nine, and two more for MSan on
+# x86_64 and aarch64).  Empty by default, so an image built without it is the
+# stock one.
 #
 # It exists for a target whose ISA subset is part of what the produced binary
 # claims, and riscv64 is that target: a caller who wants -march=rv64g cannot get
@@ -206,8 +208,8 @@ RUN apk add --no-cache \
         docker-cli~28.3 \
  && ln -sf /usr/lib/ninja-build/bin/ninja /usr/bin/ninja
 
-# A GNU ld that targets the target.  Two of the six configurations in section 5 use
-# a linker that is not lld, and one of them exists to be a link that must fail: what
+# A GNU ld that targets the target.  One of the configurations in section 5 uses a
+# linker that is not lld, and it exists to be a link that must fail: what
 # it has to fail on is what the link asks of the linker, so the ld it reaches has to
 # be able to target this architecture at all.  It is also what musl's configure
 # probes with, since a probe does not see the flags the build is given.
