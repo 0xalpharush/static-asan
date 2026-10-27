@@ -44,8 +44,9 @@ The snapshot differs from asan-static in four ways:
 - Five compiler-rt patches, `0024`–`0028`, add MemorySanitizer support: link-time interception
   and a wrap list for `libclang_rt.msan.a`, the musl `rlimit64` and `FILE` fixes MSan
   needs, and a sealed start-up for MSan. They change only the MSan runtime
-  (`compiler-rt/lib/msan/*`) and the `gen_wrap_list.py` build script, whose output for
-  ASan is byte-identical. No shared runtime source is touched —
+  (`compiler-rt/lib/msan/*`) and two build files, `gen_wrap_list.py` and
+  `add_sanitizer_rt_wrap_list` in `SanitizerUtils.cmake`, whose output for ASan is
+  byte-identical. No shared runtime source is touched —
   `sanitizer_platform_limits_posix.h` in particular is unchanged — so the ASan, TSan,
   HWASan and UBSan archives, and the md5 below, do not move. `toolchain/Dockerfile`
   also builds the MSan configs and a smoke test for them (sections 5b and 6).
