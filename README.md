@@ -232,6 +232,11 @@ then report `container-overflow`. To turn the check off, set `detect_container_o
 in `ASAN_OPTIONS` for `asan-musl.cfg`, and in the program's own
 `__asan_default_options()` for a sealed binary, which reads no environment (patch 0012).
 
+`msan-musl.cfg` and `msan-musl-sealed.cfg` link C++ against the default libc++, which is
+not built with MemorySanitizer. MSan needs every instruction that touches memory to be
+instrumented, so C++ that uses libc++ (`std::string` included) reports
+`use-of-uninitialized-value` for correct code. Use the MSan configs for C.
+
 ## Cross-building
 
 The image runs on the build machine and compiles for the target. The base image is
@@ -369,8 +374,9 @@ timeout.
 The [CI](.github/workflows/ci.yml) workflow builds the image for each of the four
 targets on each push to `main`, on each pull request and once a week. The last steps of
 `toolchain/Dockerfile` are the tests. A static musl binary runs, a static ASan binary
-reports an overflow that only a live interceptor can report, and a link without the
-wrap list fails. On x86_64 and aarch64 an MSan step follows: it runs a clean program
+reports an overflow that only a live interceptor can report, a link without the wrap
+list fails, and a sealed ASan C++ program reports a `std::string` container-overflow
+while a correct one does not. On x86_64 and aarch64 an MSan step follows: it runs a clean program
 and an uninitialized-read program, each linked plain and sealed, twelve times each,
 requires at least one pass of each and accepts no outcome other than a pass or a
 known miss (the sealed spin above, or the re-exec that the build's seccomp profile
