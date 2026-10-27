@@ -24,17 +24,23 @@
 // handler prints nothing, makes no syscall, allocates nothing and has no
 // global constructor.
 //
-// Two differences from compiler-rt.  It tests each address it is about to read
-// against the program's own image, where compiler-rt calls
-// IsAccessibleMemoryRange, which writes the address to a pipe: this handler
-// makes no syscall, and a statically linked program holds every vtable and
-// every type_info it can reach inside its image, so the bound is exact here and
-// asks the kernel nothing.  An address outside the image is a mismatch, and
-// traps, where reading it would fault.  The object's own storage is still read
-// without a test, as compiler-rt reads it, so an object whose own page is
-// unmapped faults in either.  And it compares type_info objects by address or
-// by the address of their names, which is exact in one statically linked image,
-// where each type has one type_info.
+// Two differences from compiler-rt.  It tests each address that the object's
+// vptr leads it to, before it reads it, against the program's own image, where
+// compiler-rt calls IsAccessibleMemoryRange, which writes the address to a
+// pipe: this handler makes no syscall, and a statically linked program holds
+// every vtable, type_info and type name it can reach inside its image, so the
+// bound is exact here and asks the kernel nothing.  That covers the vtable
+// prefix, each type_info node of the walk, the vptr of each node and the
+// type_info and name string it leads to, and each node's whole base-class
+// array.  The walk also visits at most kMaxNodes nodes, so a base-class graph
+// that loops inside the image ends too.  An address outside the image, or a
+// walk past the limit, is a mismatch, and traps, where reading it would fault
+// or the walk would not end.  Two reads are not tested: the object's own
+// storage, which compiler-rt reads untested too, so an object whose own page
+// is unmapped faults in either; and the check's static type_info, which the
+// compiler emits into the image.  And it compares type_info objects by address
+// or by the address of their names, which is exact in one statically linked
+// image, where each type has one type_info.
 //
 // It reads RTTI, so it is compiled with RTTI, and the code it checks must be
 // too: clang emits no vptr check in a translation unit built with -fno-rtti.
@@ -79,43 +85,84 @@ namespace {
 // at nothing; each is outside the image, so the read does not happen and the
 // handler traps instead of faulting.
 bool in_image(const void *p, unsigned long size) {
-  const char *c = static_cast<const char *>(p);
-  return c >= __executable_start && c <= _end - size;
+  uintptr_t a = reinterpret_cast<uintptr_t>(p);
+  uintptr_t lo = reinterpret_cast<uintptr_t>(__executable_start);
+  uintptr_t hi = reinterpret_cast<uintptr_t>(_end);
+  return a >= lo && a <= hi && hi - a >= size;
+}
+// Whether count elements of size elem, starting at p, all lie in the image.  A
+// division, not a product, so that no count read from memory can overflow it.
+bool in_image_array(const void *p, unsigned long count, unsigned long elem) {
+  uintptr_t a = reinterpret_cast<uintptr_t>(p);
+  uintptr_t lo = reinterpret_cast<uintptr_t>(__executable_start);
+  uintptr_t hi = reinterpret_cast<uintptr_t>(_end);
+  return a >= lo && a <= hi && count <= (hi - a) / elem;
 }
 // Mangled names of the three Itanium RTTI node kinds (libc++abi/libstdc++ share
 // them).  Classifying by name sidesteps a cross-TU dynamic_cast, whose private
-// type_info identity would not match libc++abi's own nodes.
-static const char *const kSI  = "N10__cxxabiv120__si_class_type_infoE";
-static const char *const kVMI = "N10__cxxabiv121__vmi_class_type_infoE";
+// type_info identity would not match libc++abi's own nodes.  Arrays, so that
+// sizeof bounds how far strcmp can read the name it compares them with.
+static const char kSI[]  = "N10__cxxabiv120__si_class_type_infoE";
+static const char kVMI[] = "N10__cxxabiv121__vmi_class_type_infoE";
+static_assert(sizeof(kVMI) >= sizeof(kSI), "the name bound below uses kVMI");
+// The most nodes one walk visits.  A real class hierarchy visits a few dozen;
+// the limit is what ends a walk around a base-class graph that loops.
+static const unsigned kMaxNodes = 4096;
 // checkTypeInfoEquality collapses to pointer identity in a single statically
 // linked image (one copy of each type_info), which is our case.
 bool typeinfo_eq(const std::type_info *a, const std::type_info *b) {
   return a == b || a->name() == b->name();
 }
 bool isDerivedFromAtOffset(const abi::__class_type_info *Derived,
-                           const abi::__class_type_info *Base, long Offset) {
+                           const abi::__class_type_info *Base, long Offset,
+                           unsigned &Budget) {
+  if (Budget == 0)
+    return false;
+  --Budget;
   // Every node of the walk is read, so every node must be in the image.
   if (!in_image(Derived, sizeof(abi::__vmi_class_type_info)))
     return false;
   if (typeinfo_eq(Derived, Base))
     return Offset == 0;
-  const char *k = typeid(*Derived).name();  // real embedded type_info; string-compare
+  // The node's kind is the name of its own dynamic type: its vptr, the
+  // type_info pointer in front of that vtable, that type_info, and its name.
+  // Each is tested before it is read.
+  const void *NodeVptr = *reinterpret_cast<const void *const *>(Derived);
+  if (!in_image(NodeVptr, 0))
+    return false;
+  const std::type_info *const *Slot =
+      reinterpret_cast<const std::type_info *const *>(NodeVptr) - 1;
+  if (!in_image(Slot, sizeof(*Slot)))
+    return false;
+  const std::type_info *NodeType = *Slot;
+  if (!in_image(NodeType, sizeof(std::type_info)))
+    return false;
+  const char *k = NodeType->name();
+  // strcmp stops at the first byte that differs, so it reads at most
+  // sizeof(kVMI) bytes of k.
+  if (!in_image(k, sizeof(kVMI)))
+    return false;
   if (__builtin_strcmp(k, kSI) == 0)
     return isDerivedFromAtOffset(
         static_cast<const abi::__si_class_type_info *>(Derived)->__base_type,
-        Base, Offset);
+        Base, Offset, Budget);
   if (__builtin_strcmp(k, kVMI) != 0)
     return false;  // __class_type_info leaf (no bases) or an unknown node
   const abi::__vmi_class_type_info *VTI =
       static_cast<const abi::__vmi_class_type_info *>(Derived);
-  for (unsigned base = 0; base != VTI->__base_count; ++base) {
+  // The whole base-class array must be in the image, however large the count.
+  unsigned long Count = VTI->__base_count;
+  if (!in_image_array(VTI->__base_info, Count,
+                      sizeof(abi::__base_class_type_info)))
+    return false;
+  for (unsigned long base = 0; base != Count; ++base) {
     long OffsetHere = VTI->__base_info[base].__offset_flags >>
                       abi::__base_class_type_info::__offset_shift;
     if (VTI->__base_info[base].__offset_flags &
         abi::__base_class_type_info::__virtual_mask)
       return true;  // conservative: a virtual base cannot be ruled out here
     if (isDerivedFromAtOffset(VTI->__base_info[base].__base_type, Base,
-                              Offset - OffsetHere))
+                              Offset - OffsetHere, Budget))
       return true;
   }
   return false;
@@ -138,7 +185,8 @@ bool checkDynamicType(void *Object, void *Type, HashValue Hash) {
   abi::__class_type_info *Derived =
       static_cast<abi::__class_type_info *>(Prefix->TypeInfo);
   abi::__class_type_info *Base = reinterpret_cast<abi::__class_type_info *>(Type);
-  if (!isDerivedFromAtOffset(Derived, Base, -Prefix->Offset)) return false;
+  unsigned Budget = kMaxNodes;
+  if (!isDerivedFromAtOffset(Derived, Base, -Prefix->Offset, Budget)) return false;
   __ubsan_vptr_type_cache[Hash % VptrTypeCacheSize] = Hash;  // compiler-rt cache protocol
   return true;
 }
