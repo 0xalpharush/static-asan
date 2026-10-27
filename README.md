@@ -261,13 +261,18 @@ checks call and the cache that they read. The handler makes compiler-rt's decisi
 on a mismatch, executes the trap instruction, so a bad downcast or a member call on an object of
 another dynamic type ends as a trap-mode check does. Before it reads the vtable, the type
 information and the base-class lists, it checks that each address lies inside the program's
-image, and treats one outside it as a mismatch; it makes no syscall for this. It does not check
-the object's own storage, which compiler-rt does not check either. Its search of the base
-classes goes at most 512 levels deep and visits at most 2^20 − 1 base classes in all (2^20
-classes counting the one it starts from; a class that occurs more than once is counted each
-time); a search that either limit stops is a mismatch and traps, even in a correct program,
-and the source comment says which programs that can be. Code compiled with `-fno-rtti` gets
-no vptr check.
+image, and it reads no address outside it: a vtable outside it is a mismatch, and a class whose
+type information or base-class list lies outside it ends that branch of the search of the base
+classes. It makes no syscall for this. It does
+not check the object's own storage, which compiler-rt does not check either. Its search of the
+base classes follows a path at most 512 levels deep and visits at most 2^20 − 1 base classes in
+all (2^20 classes counting the one it starts from; a class that occurs more than once is counted
+each time). A limit ends only the branch it stops: the search goes on with the other bases of
+the classes it has visited, and a virtual base among them still counts as a match, as it does in
+compiler-rt. A search that ends with no match is a mismatch and traps, so a correct program whose
+match lies only past a limit traps, unless the search counts a virtual base as a match; the
+source comment says which programs those can be. Code compiled with `-fno-rtti` gets no vptr
+check.
 clang reads a config's options before the command line, so a command line that adds
 `-fsanitize-trap=all` must add `-fno-sanitize-trap=vptr` after it; clang refuses vptr in trap
 mode. A link with these flags and without the archive fails on

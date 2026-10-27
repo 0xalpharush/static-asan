@@ -32,25 +32,33 @@
 // bound is exact here and asks the kernel nothing.  That covers the vtable
 // prefix, each type_info node of the walk, the vptr of each node and the
 // type_info and name string it leads to, and each node's whole base-class
-// array.  An address outside the image is a mismatch, and traps, where reading
-// it would fault.  Two reads are not tested: the object's own storage, which
+// array.  It reads no address outside the image, where reading could fault: at
+// the vtable or its prefix such an address is a mismatch, and traps; at a node
+// of the walk it ends that branch of the search, as a limit does (below).  Two
+// reads are not tested: the object's own storage, which
 // compiler-rt reads untested too, so an object whose own page is unmapped
 // faults in either; and the check's static type_info, which the compiler emits
 // into the image.  And it compares type_info objects by address
 // or by the address of their names, which is exact in one statically linked
 // image, where each type has one type_info.
 //
-// The walk has two limits that compiler-rt's has not, and a search that either
-// one stops is a mismatch, and traps.  It goes at most kMaxDepth (512) base
-// classes down from the dynamic type: a path deeper than that is not followed,
-// so a base that is found only below it is not found, and a base-class graph
-// that loops inside the image ends there.  The 513 frames of a walk that deep
-// fit well inside a musl thread's default 128 KiB stack.  And it visits at most
-// kMaxNodes (1 << 20) nodes in all, the dynamic type included: a search that
-// needs more stops after that many, and the check traps, even if a node it has
-// not visited would match.  A correct program whose search needs more nodes
-// than that, which takes about a million base subobjects of class type,
-// therefore traps.
+// The walk has two limits that compiler-rt's has not.  It follows a path at
+// most kMaxDepth (512) base classes down from the dynamic type, and it visits
+// at most kMaxNodes (1 << 20) nodes in all, the dynamic type included.  The
+// depth limit ends a base-class graph that loops inside the image, and the 513
+// frames of a walk that deep fit well inside a musl thread's default 128 KiB
+// stack.  The node limit ends a walk over an acyclic graph whose paths
+// multiply, which the depth limit alone does not bound.
+//
+// A limit ends only the branch it stops: a node deeper than kMaxDepth, and every
+// node after the kMaxNodes-th, is not visited, so nothing at or below it can
+// match.  The walk goes on with the other bases of the nodes it has visited,
+// and a virtual base among them still counts as a match, as it does in
+// compiler-rt.  A search that ends with no match is a mismatch, and traps.  So
+// a correct program whose match lies only past a limit traps, unless the walk
+// counts a virtual base as a match: that takes a match more than 512 base
+// classes down, or one that the walk would reach only after visiting more than
+// 2^20 nodes, which takes about a million base subobjects of class type.
 //
 // It reads RTTI, so it is compiled with RTTI, and the code it checks must be
 // too: clang emits no vptr check in a translation unit built with -fno-rtti.
