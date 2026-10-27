@@ -7,8 +7,8 @@
 # fails, and on x86_64 and aarch64 the static MSan binaries, plain and sealed, run
 # and report (section 6 of the Dockerfile).  x86_64 and aarch64 each build on a
 # runner of their own architecture, so those steps run natively: MSan cannot run
-# under qemu-user, and an emulated MSan step records itself as not verified
-# rather than failing or passing.  riscv64 and armv7 are cross-built on x86_64
+# under qemu-user, and an emulated MSan step fails the build under the default
+# VERIFY_RUNTIME=require.  riscv64 and armv7 are cross-built on x86_64
 # and run their steps under qemu-user; they have no MSan runtime.  After the
 # build, one step links hello world with asan-musl.cfg and requires that the
 # binary has no PT_INTERP, no DT_NEEDED and no dynamic symbol table, and another
@@ -250,9 +250,10 @@ jobs:
           echo "no PT_INTERP, no DT_NEEDED, no dynamic symbol table; ASan runtime linked"
 
       - name: the image records no unverified runtime
-        # VERIFY_RUNTIME stays "require" here, so a constrained address space fails
-        # the build; this catches the one deferral that does not, an MSan step that
-        # found itself under emulation.
+        # VERIFY_RUNTIME stays "require" here, so every deferral -- a constrained
+        # address space, or an MSan step that found itself under emulation --
+        # already fails the build.  This holds the image to that: nothing in it
+        # may say that a check did not run.
         run: |
           set -euo pipefail
           if docker run --rm tc-asan-musl:ci cat /opt/asan-static/RUNTIME-UNVERIFIED; then

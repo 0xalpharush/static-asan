@@ -52,8 +52,10 @@
 # <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these four
 # steps need it.  Nothing the image is for does.  MSan cannot run under
 # qemu-user at all (qemu places the guest stack inside MSan's fixed ranges), so
-# the MSan step detects emulation and records its runs as not verified instead
-# of running them; see that step.
+# the MSan step detects emulation and does not run its binaries; it treats that
+# as a deferral, through VERIFY_RUNTIME like the ASan check: the default,
+# "require", fails the build, and "defer" records the MSan runs as not
+# verified.  Build aarch64 natively to have MSan checked; see that step.
 #
 # Sources are taken from the mounted checkouts at their pinned base commits with
 # git archive, unpacked into the image and patched there, so the patch series is
@@ -1255,9 +1257,12 @@ RUN set -eu; \
 # stack inside MSan's origin range, and both the plain and the sealed runs fail.
 # So the step first runs a static probe and reads /proc/<pid>/exe from outside
 # it: natively that is the probe itself, under binfmt_misc it is the emulator.
-# Under emulation nothing is run, nothing is reported as passing, and the step
-# appends to RUNTIME-UNVERIFIED that MSan was not verified.  CI builds aarch64
-# on a native arm64 runner, so CI runs these binaries for real.
+# Under emulation nothing is run and nothing is reported as passing, and the
+# miss goes through VERIFY_RUNTIME like the others: "require" fails the build
+# saying so, "defer" appends to RUNTIME-UNVERIFIED that MSan was not verified.
+# The targets without an msan runtime (riscv64, armv7) skip this step before
+# the probe.  CI builds aarch64 on a native arm64 runner, so CI runs these
+# binaries for real.
 #
 # Last, a negative link: the clean program against the statically intercepting
 # resource dir, with --gc-sections as both MSan configs pass it, and WITHOUT the
@@ -1311,7 +1316,17 @@ RUN set -eu; \
     /tmp/msan_probe & probe=$!; sleep 1; \
     probe_exe=$(readlink "/proc/$probe/exe" || true); kill -9 "$probe"; wait "$probe" 2>/dev/null || true; \
     if [ "$probe_exe" != /tmp/msan_probe ]; then \
-      echo "msan: target binaries run through $probe_exe, not natively; MSan does not run under emulation" >&2; \
+      printf '%s\n' "" \
+        "  This build runs the target's binaries through $probe_exe" \
+        "  (binfmt_misc emulation), not natively.  MemorySanitizer's fixed layout" \
+        "  does not hold under qemu-user, so none of the MSan binaries was run and" \
+        "  whether MSan works in this image has not been tested either way.  The" \
+        "  compiles and links succeeded.  Build on a machine of the target's own" \
+        "  architecture to have it checked." "" >&2; \
+      if [ "$VERIFY_RUNTIME" != defer ]; then \
+        printf '%s\n' "  To build the image anyway:  --build-arg VERIFY_RUNTIME=defer" "" >&2; \
+        exit 1; \
+      fi; \
       unverified "every run (clean and umr, plain and sealed)" \
         "The build ran the target's binaries through $probe_exe (binfmt_misc emulation), under which MSan's fixed layout does not hold, so none was run."; \
       exit 0; \

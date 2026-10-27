@@ -1,4 +1,4 @@
-From 9309267b7e203dda031f8e119327bed922f0dbaa Mon Sep 17 00:00:00 2001
+From 517d98f8531e860c7a722f4e03ee4104b9f3ecd1 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:15:00 +0000
 Subject: [PATCH] [compiler-rt] msan: no-op unpoison_file on musl, in MSan code

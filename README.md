@@ -183,8 +183,10 @@ same rule: when no run of one of its binaries passes under a set `RLIMIT_AS`, an
 runs that missed could not map MSan's shadow (plain) or spun (sealed), `require`
 fails the build and `defer` appends that binary to `RUNTIME-UNVERIFIED`. A cross
 build that runs the target's binaries under `qemu-user` does not run the MSan
-binaries at all, because MSan's fixed layout does not hold under the emulator. It
-appends that to `RUNTIME-UNVERIFIED` and does not fail.
+binaries at all, because MSan's fixed layout does not hold under the emulator. That
+is a deferral too: `require` fails the build and `defer` appends it to
+`RUNTIME-UNVERIFIED`. riscv64 and armv7 have no MSan runtime and skip the MSan check
+entirely.
 
 ### Using the image
 
@@ -225,8 +227,10 @@ build machine must be able to run them. On Linux, register `qemu-user` with
 `binfmt_misc` for the target, for example with the `qemu-user-static` package or with
 `docker run --privileged tonistiigi/binfmt --install <arch>`. Only these four steps
 need the emulator. The MSan check detects the emulator and does not run its binaries
-under it; it records them in `/opt/asan-static/RUNTIME-UNVERIFIED` instead. Build
-aarch64 on an aarch64 machine to have MSan checked.
+under it. With the default `VERIFY_RUNTIME=require` that fails the build; with
+`VERIFY_RUNTIME=defer` the check records them in
+`/opt/asan-static/RUNTIME-UNVERIFIED` instead. Build aarch64 on an aarch64 machine to
+have MSan checked.
 
 `--build-arg TOOLCHAIN_PLATFORM=linux/<arch> --platform linux/<arch>` builds the
 image on the target architecture under emulation instead. This gives the same
@@ -296,7 +300,7 @@ through the same interceptor as before.
 | `compiler-rt/0024` | Gives MSan the same link-time interception asan has: `SANITIZER_STATIC_INTERCEPTION` for msan's cflags, a `clang_rt.msan` wrap list, and a per-runtime present-symbol (`__msan_wrap_list_present`) that `add_sanitizer_rt_wrap_list` passes to `gen_wrap_list.py` and `__msan_init` references from code, so a static-musl MSan link attaches its interceptors with `ld --wrap` and a link without the list fails, also with `--gc-sections`. |
 | `compiler-rt/0025` | On musl, reads the `getrlimit64`/`prlimit64` result through `struct_rlimit_sz` (musl's `rlimit64` is `rlimit`) instead of the glibc-only `struct_rlimit64_sz`, whose undefined symbol otherwise fails every static-musl MSan link. |
 | `compiler-rt/0026` | Sealed: `__msan_init` records its frame like `__asan_init`. On x86_64/aarch64 this sets the top of the sealed main-thread stack window that `MsanThread::Init`'s `CHECK(AddrIsInStack())` reads; without it that check failed in 6 of 80 sealed runs (x86_64). |
-| `compiler-rt/0027` | Sealed: gives MSan a sealed start-up. At the top of `__msan_init`, before the runtime's first mapping, it reserves the shadow, origin, invalid and allocator ranges with `MAP_FIXED_NOREPLACE` and spins on refusal (like asan's `SealedReserveShadow`); it pins the common flags asan's `SealFlags` pins, `clear_shadow_mmap_threshold` included, so no signal handler is installed, a detection dies by `SIGABRT` and the shadow is never re-mapped; and it makes `ReExec` unreachable. |
+| `compiler-rt/0027` | Sealed: gives MSan a sealed start-up. At the top of `__msan_init`, before the runtime's first mapping, it reserves the shadow, origin, invalid and allocator ranges, and the allocator's region-info array above them, with `MAP_FIXED_NOREPLACE` and spins on refusal (like asan's `SealedReserveShadow`); it pins the common flags asan's `SealFlags` pins, `clear_shadow_mmap_threshold` included, so no signal handler is installed, a detection dies by `SIGABRT` and the shadow is never re-mapped; it creates the symbolizer only when a report needs it, so start-up does not look for `llvm-symbolizer`; and it makes `ReExec` unreachable. |
 | `compiler-rt/0028` | MSan-only: turns `SANITIZER_HAS_STRUCT_FILE` off under `SANITIZER_MUSL` inside `msan_interceptors.cpp` (not the shared header), so `unpoison_file` is a no-op on musl without rebuilding any other runtime. |
 
 ## Known limitation: the sealed runtime spins when it cannot get memory
@@ -329,18 +333,14 @@ the mappings the kernel makes at start-up falls inside MSan's ranges. MSan's x86
 and aarch64 layouts have fixed shadow, origin and allocator ranges. Before `main`,
 the sealed runtime reserves all of them with `MAP_FIXED_NOREPLACE` (patch 0027). A
 mapping already there is a refusal, and a sealed runtime may not re-exec to move
-it, so the process spins. A plain MSan binary re-execs with ASLR off instead. The
-maintainers measured two cases on an x86_64 kernel that places `[vvar]` and `[vdso]`
-in the mmap area:
+it, so the process spins. A plain MSan binary re-execs with ASLR off instead.
+Measured on an x86_64 kernel that places `[vvar]` and `[vdso]` in the mmap area:
 
 - with `vm.mmap_rnd_bits=32`, about one run in four (31 of 120) spins;
 - with an unlimited stack limit (`ulimit -s unlimited`), every run spins. The kernel
   then uses the legacy bottom-up layout, which starts inside MSan's shadow.
 
-The spin depends on where the kernel puts its own mappings. On Linux 6.8, which
-places `[vdso]` next to the stack, this series' sealed binaries did not spin in 80
-runs with `vm.mmap_rnd_bits=32` or in 20 runs with an unlimited stack. Use a timeout
-when you run sealed MSan binaries, as for sealed ASan.
+Use a timeout when you run sealed MSan binaries, as for sealed ASan.
 
 ## CI
 

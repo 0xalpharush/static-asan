@@ -1,4 +1,4 @@
-From 7197dd4244e350d96aaf355321d8997f168b7d97 Mon Sep 17 00:00:00 2001
+From b022028975be6b5ce0c4d78aa245f21e2cfe3e71 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:10:00 +0000
 Subject: [PATCH] [compiler-rt] msan: a sealed start-up
@@ -27,7 +27,7 @@ spins on refusal via the common SealedHangOnAllocationFailure -- the shape of
 0019's SealedReserveShadow for ASan.  The map/protect rule is one helper,
 LayoutRangeAction, which InitShadow now uses too, so the two cannot disagree.
 
-Two things differ from asan and both matter:
+Three things differ from asan and all three matter:
 
   - The ALLOCATOR range is reserved as well, PROT_NONE.  MSan's primary
     allocator has a fixed base (msan_allocator.cpp: 0x700000000000 on x86_64,
@@ -35,7 +35,13 @@ Two things differ from asan and both matter:
     picks its base.  Left open, a mapping the kernel placed in that range was
     silently replaced: the runtime's own first pages, or the [vdso] and [vvar].
     Reserved, such a mapping is a refusal (the spin), and the allocator's
-    MAP_FIXED lands on the runtime's own reservation.
+    MAP_FIXED lands on the runtime's own reservation.  The allocator also
+    maps its region-info array, AdditionalSize() bytes (8 KiB on x86_64), with
+    MAP_FIXED at the end of its space -- in the APP range just above the
+    ALLOCATOR one -- so that range is reserved PROT_NONE too.
+    msan_allocator.cpp reports it (MsanAllocatorRegionInfoRange), from the
+    allocator's own parameters and SizeClassAllocator64::AdditionalSize(), so
+    the shared allocator header is not touched.
 
   - The reservation is made at the top of __msan_init, right after the frame is
     recorded and before AvoidCVE_2016_2143(), as AsanInitInternal reserves
@@ -46,6 +52,20 @@ Two things differ from asan and both matter:
     __msan_get_track_origins() reads a link-time symbol, not a flag, so it is
     known there.  The later InitShadowWithReExec call finds the layout reserved
     and does nothing.
+
+  - The symbolizer is not created at start-up.  __msan_init used to call
+    Symbolizer::GetOrInit()->AddHooks(...) unconditionally, and creating the
+    symbolizer chooses a tool, which looks for llvm-symbolizer on the
+    filesystem: a newfstatat on every sealed run.  AsanInitInternal skips its
+    symbolizer initialization when sealed for the same reason.  The hooks are
+    what keep MSan from checking the symbolizer's own memory, so they cannot
+    simply be dropped: MsanEnsureSymbolizerHooks creates the symbolizer and
+    installs them once, and is called from __msan_init when unsealed (as
+    before) and, sealed or not, from GET_FATAL_STACK_TRACE_PC_BP and
+    GET_FATAL_STACK_TRACE_IF_EMPTY, which every MSan report, CHECK failure and
+    __sanitizer_print_stack_trace passes through before it symbolizes.  A
+    sealed run therefore looks for a symbolizer only once it is reporting,
+    which is outside the seal, as for asan.
 
 SealFlags (msan.cpp).  ASan pins a set of sanitizer-neutral common flags in
 asan_flags.cpp's SealFlags(); MSan had none.  The same common flags are pinned
@@ -73,39 +93,74 @@ MSan's shadow, and the reservation then refuses: the sealed spin, which
 README.md's "Known limitation" describes.
 
 Measured, x86_64, Linux 6.8, the sealed clean and uninitialized-read programs of
-the Dockerfile's MSan check, run directly on the host (no seccomp), ASLR on:
+the Dockerfile's MSan check, run directly on the host (no seccomp), ASLR on,
+40 runs each:
 
-  vm.mmap_rnd_bits=32, 40 runs each.  The previous version of this patch
-  (reservation inside InitShadowWithReExec, allocator range open): clean 24
-  passed, 16 SIGSEGV; uninitialized read 35 reported and aborted (134), 5
-  SIGSEGV.  This version: clean 40 passed; uninitialized read 40 reported and
-  aborted.  No SIGSEGV, no spin.
-  vm.mmap_rnd_bits=28 (the host's setting), 40 runs each: 40 and 40 passed
-  with either version.
-  ulimit -s unlimited, 10 runs each: 10 and 10 passed.  This kernel places
-  [vdso] beside the stack, not in the mmap area, so neither case spun here.
+  vm.mmap_rnd_bits=32.  The first version of this patch (reservation inside
+  InitShadowWithReExec, allocator range open): clean 24 passed, 16 SIGSEGV;
+  uninitialized read 35 reported and aborted (134), 5 SIGSEGV.  This version:
+  clean 40 passed; uninitialized read 40 reported once and aborted (134).  No
+  SIGSEGV, no spin.
+  vm.mmap_rnd_bits=28: 40 and 40 passed, with either version.
 
-strace of a sealed run of a program that does malloc(8 MiB), memset and free:
-after the start-up reservation no MAP_FIXED mapping lands in a shadow or origin
-range.  The MAP_FIXED mappings left are the allocator's 4 TiB onto its own
-reservation, together with 8 KiB at 0x740000000000 just above it for the
-allocator's region metadata (upstream's TotalSpaceSize; not reserved here, since
-it lies in an APP range); 128 KiB inside an 8 MiB PROT_NONE range the runtime
-had reserved for itself; and musl's own brk guard page, which the uninstrumented
-program makes too.  The freed block's shadow is handed back
-with one madvise(MADV_DONTNEED) inside the shadow reservation.  Before
-clear_shadow_mmap_threshold was pinned, the maintainers' trace of the same
-program showed three 8 MiB MAP_FIXED mappings inside shadow-3.
+Inside a container with Docker's default seccomp profile, at
+vm.mmap_rnd_bits=32, the Dockerfile's check with 40 runs per binary: sealed
+clean 40 and sealed uninitialized read 40 passed; the plain binaries passed 33
+and 28 times, and every other run was the re-exec the profile refuses.
+
+strace, sealed.  A clean run makes no newfstatat or open for llvm-symbolizer;
+an uninitialized-read run looks for it once, after the report has begun, and
+prints one report.  For a program that does malloc(8 MiB), memset and free,
+every MAP_FIXED after the start-up reservation lands on a mapping the runtime
+or libc made for itself: the allocator's 4 TiB and its 8 KiB region-info array
+onto the PROT_NONE reservations made for them, 128 KiB inside an 8 MiB
+PROT_NONE range the runtime reserved, and musl's brk guard page, which the
+uninstrumented program makes too.  None lands in a shadow or origin range, and
+the freed block's shadow is handed back with one madvise(MADV_DONTNEED) inside
+the shadow reservation.  With the first version of this patch the same
+program's trace had three 8 MiB MAP_FIXED mappings inside shadow-3: the
+unpoisoning of the sealed main-thread stack window at start-up, and two for the
+allocation.
 ---
- compiler-rt/lib/msan/msan.cpp       |  85 +++++++++++++++++-
- compiler-rt/lib/msan/msan_linux.cpp | 128 ++++++++++++++++++++++++++--
- 2 files changed, 205 insertions(+), 8 deletions(-)
+ compiler-rt/lib/msan/msan.cpp           | 115 +++++++++++++++++++-
+ compiler-rt/lib/msan/msan.h             |   8 ++
+ compiler-rt/lib/msan/msan_allocator.cpp |  17 +++
+ compiler-rt/lib/msan/msan_linux.cpp     | 135 ++++++++++++++++++++++--
+ 4 files changed, 265 insertions(+), 10 deletions(-)
 
 diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
-index 161a8d708..a0dcc880b 100644
+index 161a8d708..3ebf0e5a6 100644
 --- a/compiler-rt/lib/msan/msan.cpp
 +++ b/compiler-rt/lib/msan/msan.cpp
-@@ -174,6 +174,69 @@ static void RegisterMsanFlags(FlagParser *parser, Flags *f) {
+@@ -102,6 +102,27 @@ namespace __msan {
+ static THREADLOCAL int is_in_symbolizer_or_unwinder;
+ static void EnterSymbolizerOrUnwider() { ++is_in_symbolizer_or_unwinder; }
+ static void ExitSymbolizerOrUnwider() { --is_in_symbolizer_or_unwinder; }
++
++// Creates the symbolizer and installs the two hooks above on it, once.  The
++// hooks are what make an interceptor the symbolizer reaches not check the
++// symbolizer's own memory.  An unsealed run calls this from __msan_init, as
++// upstream does.  A sealed run does not create the symbolizer at start-up, so
++// this is also called from GET_FATAL_STACK_TRACE_PC_BP and
++// GET_FATAL_STACK_TRACE_IF_EMPTY, which every MSan report, CHECK failure and
++// __sanitizer_print_stack_trace goes through before it symbolizes anything:
++// whichever comes first creates the symbolizer with the hooks on it.  After the
++// first call this is one load.
++void MsanEnsureSymbolizerHooks() {
++  static atomic_uint8_t installed;
++  if (atomic_load(&installed, memory_order_acquire))
++    return;
++  // Claimed before GetOrInit, so that a CHECK failing inside it, which comes
++  // back here through CheckUnwind, does not install the hooks twice.
++  if (atomic_exchange(&installed, 1, memory_order_acq_rel))
++    return;
++  Symbolizer::GetOrInit()->AddHooks(EnterSymbolizerOrUnwider,
++                                    ExitSymbolizerOrUnwider);
++}
+ bool IsInSymbolizerOrUnwider() { return is_in_symbolizer_or_unwinder; }
+ 
+ struct UnwinderScope {
+@@ -174,6 +195,69 @@ static void RegisterMsanFlags(FlagParser *parser, Flags *f) {
                            "deprecated, use halt_on_error");
  }
  
@@ -175,7 +230,7 @@ index 161a8d708..a0dcc880b 100644
  static void InitializeFlags() {
    SetCommonFlagsDefaults();
    {
-@@ -253,6 +316,8 @@ static void InitializeFlags() {
+@@ -253,6 +337,8 @@ static void InitializeFlags() {
      Die();
    }
    if (f->store_context_size < 1) f->store_context_size = 1;
@@ -184,7 +239,7 @@ index 161a8d708..a0dcc880b 100644
  }
  
  void PrintWarningWithOrigin(uptr pc, uptr bp, u32 origin) {
-@@ -487,6 +552,18 @@ void __msan_init() {
+@@ -487,6 +573,18 @@ void __msan_init() {
    uptr msan_init_frame;
    SealedSetInitFrame(reinterpret_cast<uptr>(&msan_init_frame));
  
@@ -203,7 +258,7 @@ index 161a8d708..a0dcc880b 100644
    AvoidCVE_2016_2143();
  
    CacheBinaryName();
-@@ -506,7 +583,13 @@ void __msan_init() {
+@@ -506,7 +604,13 @@ void __msan_init() {
    InstallAtExitHandler(); // Needs __cxa_atexit interceptor.
  
    DisableCoreDumperIfNecessary();
@@ -218,8 +273,85 @@ index 161a8d708..a0dcc880b 100644
      VPrintf(1, "Unlimited stack, doing reexec\n");
      // A reasonably large stack size. It is bigger than the usual 8Mb, because,
      // well, the program could have been run with unlimited stack for a reason.
+@@ -527,8 +631,13 @@ void __msan_init() {
+     Die();
+   }
+ 
+-  Symbolizer::GetOrInit()->AddHooks(EnterSymbolizerOrUnwider,
+-                                    ExitSymbolizerOrUnwider);
++  // Sealed mode does not create the symbolizer here, as AsanInitInternal does
++  // not: creating it chooses a symbolizer tool, which looks for
++  // llvm-symbolizer on the filesystem (a newfstatat), on a run that may never
++  // report anything.  The hooks are installed when it is created instead, by
++  // the first fatal stack trace; see MsanEnsureSymbolizerHooks.
++  if (!SealedInit())
++    MsanEnsureSymbolizerHooks();
+ 
+   InitializeCoverage(common_flags()->coverage, common_flags()->coverage_dir);
+ 
+diff --git a/compiler-rt/lib/msan/msan.h b/compiler-rt/lib/msan/msan.h
+index 7fb58be67..8d35c92e1 100644
+--- a/compiler-rt/lib/msan/msan.h
++++ b/compiler-rt/lib/msan/msan.h
+@@ -268,6 +268,12 @@ char *GetProcSelfMaps();
+ void InitializeInterceptors();
+ 
+ void MsanAllocatorInit();
++// The range the primary allocator maps with MAP_FIXED beyond its fixed space,
++// for its region-info array; empty where there is none.  See
++// SealedReserveShadow.
++void MsanAllocatorRegionInfoRange(uptr *beg, uptr *size);
++// Creates the symbolizer and installs MSan's hooks on it, once.  See msan.cpp.
++void MsanEnsureSymbolizerHooks();
+ void MsanDeallocate(BufferedStackTrace *stack, void *ptr);
+ 
+ void *msan_malloc(uptr size, BufferedStackTrace *stack);
+@@ -330,6 +336,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
+   GET_STORE_STACK_TRACE_PC_BP(StackTrace::GetCurrentPc(), GET_CURRENT_FRAME())
+ 
+ #define GET_FATAL_STACK_TRACE_PC_BP(pc, bp)                              \
++  __msan::MsanEnsureSymbolizerHooks();                                   \
+   UNINITIALIZED BufferedStackTrace stack;                                \
+   if (msan_inited) {                                                     \
+     stack.Unwind(pc, bp, nullptr, common_flags()->fast_unwind_on_fatal); \
+@@ -341,6 +348,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
+ // Unwind the stack for fatal error, as the parameter `stack` is
+ // empty without origins.
+ #define GET_FATAL_STACK_TRACE_IF_EMPTY(STACK)                                 \
++  __msan::MsanEnsureSymbolizerHooks();                                        \
+   if (msan_inited && (STACK)->size == 0) {                                    \
+     (STACK)->Unwind(StackTrace::GetCurrentPc(), GET_CURRENT_FRAME(), nullptr, \
+                     common_flags()->fast_unwind_on_fatal);                    \
+diff --git a/compiler-rt/lib/msan/msan_allocator.cpp b/compiler-rt/lib/msan/msan_allocator.cpp
+index d7d4967c9..5d6ac4c2b 100644
+--- a/compiler-rt/lib/msan/msan_allocator.cpp
++++ b/compiler-rt/lib/msan/msan_allocator.cpp
+@@ -154,6 +154,23 @@ static StaticSpinMutex fallback_mutex;
+ 
+ static uptr max_malloc_size;
+ 
++// The primary allocator reserves kSpaceSize + AdditionalSize() at its fixed
++// base and maps its region-info array, AdditionalSize() bytes, at SpaceEnd()
++// with MAP_FIXED -- past the end of the ALLOCATOR range kMemoryLayout names, in
++// the APP range above it.  Sealed start-up reserves this range too, so a
++// mapping already there is a refusal rather than something the MAP_FIXED
++// silently replaces.
++void __msan::MsanAllocatorRegionInfoRange(uptr *beg, uptr *size) {
++#if defined(__mips64)
++  // SizeClassAllocator32: no fixed space and no region-info map.
++  *beg = 0;
++  *size = 0;
++#else
++  *beg = AP64::kSpaceBeg + AP64::kSpaceSize;
++  *size = PrimaryAllocator::AdditionalSize();
++#endif
++}
++
+ void __msan::MsanAllocatorInit() {
+   SetAllocatorMayReturnNull(common_flags()->allocator_may_return_null);
+   allocator.Init(common_flags()->allocator_release_to_os_interval_ms);
 diff --git a/compiler-rt/lib/msan/msan_linux.cpp b/compiler-rt/lib/msan/msan_linux.cpp
-index 7140de7e9..1eb71b712 100644
+index 7140de7e9..c10417944 100644
 --- a/compiler-rt/lib/msan/msan_linux.cpp
 +++ b/compiler-rt/lib/msan/msan_linux.cpp
 @@ -34,9 +34,18 @@
@@ -287,7 +419,7 @@ index 7140de7e9..1eb71b712 100644
        if (dry_run && type == MappingDesc::ALLOCATOR &&
            !CheckMemoryRangeAvailability(start, size, !dry_run))
          return false;
-@@ -172,7 +198,95 @@ static bool InitShadow(bool init_origins, bool dry_run) {
+@@ -172,7 +198,102 @@ static bool InitShadow(bool init_origins, bool dry_run) {
    return true;
  }
  
@@ -334,8 +466,11 @@ index 7140de7e9..1eb71b712 100644
 +// mapping the kernel placed there -- the [vdso] and [vvar] it places at exec,
 +// or any unhinted mapping the runtime makes before the allocator starts --
 +// would be replaced by that MAP_FIXED without a word.  Reserved, such a mapping is a refusal here (the spin), and
-+// the allocator's MAP_FIXED later lands on the runtime's own reservation.  APP
-+// ranges are left alone: the program is already in them.
++// the allocator's MAP_FIXED later lands on the runtime's own reservation.  So
++// is the one piece of an APP range the allocator maps with MAP_FIXED: its
++// region-info array, AdditionalSize() bytes at the end of its space, which is
++// the end of the ALLOCATOR range (MsanAllocatorRegionInfoRange).  The rest of
++// the APP ranges is left alone: the program is already in them.
 +//
 +// No madvise: the sealed shadow is neither MADV_DONTDUMP nor hinted
 +// (sanitizer_sealed.h).
@@ -362,6 +497,10 @@ index 7140de7e9..1eb71b712 100644
 +        break;
 +    }
 +  }
++  uptr region_info_beg, region_info_size;
++  MsanAllocatorRegionInfoRange(&region_info_beg, &region_info_size);
++  if (region_info_size && region_info_beg < maxVirtualAddress)
++    SealedReserveRange(region_info_beg, region_info_size, PROT_NONE);
 +  sealed_layout_reserved = true;
 +}
 +#  endif  // SANITIZER_LINUX
