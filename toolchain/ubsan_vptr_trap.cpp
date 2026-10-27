@@ -40,16 +40,17 @@
 // or by the address of their names, which is exact in one statically linked
 // image, where each type has one type_info.
 //
-// The walk has two limits that compiler-rt's has not, and a search that reaches
-// either one is a mismatch, and traps.  It goes at most kMaxDepth (512) base
+// The walk has two limits that compiler-rt's has not, and a search that either
+// one stops is a mismatch, and traps.  It goes at most kMaxDepth (512) base
 // classes down from the dynamic type: a path deeper than that is not followed,
 // so a base that is found only below it is not found, and a base-class graph
-// that loops inside the image ends there.  512 frames of the walk fit well
-// inside a musl thread's default 128 KiB stack.  And it visits at most kMaxNodes
-// (1 << 20) nodes in all: when it has visited that many it stops, and the check
-// traps, even if a node it has not visited would match.  A correct program
-// whose search visits more nodes than that, which needs about a million base
-// subobjects of class type, therefore traps.
+// that loops inside the image ends there.  The 513 frames of a walk that deep
+// fit well inside a musl thread's default 128 KiB stack.  And it visits at most
+// kMaxNodes (1 << 20) nodes in all, the dynamic type included: a search that
+// needs more stops after that many, and the check traps, even if a node it has
+// not visited would match.  A correct program whose search needs more nodes
+// than that, which takes about a million base subobjects of class type,
+// therefore traps.
 //
 // It reads RTTI, so it is compiled with RTTI, and the code it checks must be
 // too: clang emits no vptr check in a translation unit built with -fno-rtti.
