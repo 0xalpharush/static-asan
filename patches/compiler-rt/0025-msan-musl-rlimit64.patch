@@ -1,4 +1,4 @@
-From 7e488974e5592f0568690ea331467eda81ad069e Mon Sep 17 00:00:00 2001
+From 4945b81e4e7e64195b2c547e1436220c116d6b48 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:00:00 +0000
 Subject: [PATCH] [compiler-rt] msan: read rlimit64 as musl's one rlimit size
@@ -17,22 +17,26 @@ musl has one rlimit layout.  Its rlimit64 is rlimit -- rlim_t is 64 bits on
 every musl target -- so there is no separate rlimit64 to describe and
 struct_rlimit_sz is the size for both the 32- and the 64-bit interceptor.  The
 getrlimit/prlimit interceptors already read struct_rlimit_sz, which musl does
-define, so this is the same size they use.  A small constant selects it under
+define, so this is the same size they use.  A small function selects it under
 SANITIZER_MUSL and keeps struct_rlimit64_sz on glibc, where the two differ in
-name but not, on a 64-bit target, in size.
+name but not, on a 64-bit target, in size.  It is a function and not a
+namespace-scope constant because both sizes are extern variables: a constant
+initialized from one is a dynamic initializer, which would give
+msan_interceptors.cpp.o a global constructor (an .init_array entry) where
+compiler-rt's runtimes have none.
 
 This is the musl-layout substitution patches 0004-0011 make for msghdr,
 shmid_ds, the time types and mktime, applied to the one remaining MSan
 interceptor that named a glibc-only size.
 ---
- compiler-rt/lib/msan/msan_interceptors.cpp | 18 +++++++++++++++---
- 1 file changed, 15 insertions(+), 3 deletions(-)
+ compiler-rt/lib/msan/msan_interceptors.cpp | 23 +++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
 
 diff --git a/compiler-rt/lib/msan/msan_interceptors.cpp b/compiler-rt/lib/msan/msan_interceptors.cpp
-index 76255cd..52cd2b3 100644
+index 76255cdb7..1462b2e16 100644
 --- a/compiler-rt/lib/msan/msan_interceptors.cpp
 +++ b/compiler-rt/lib/msan/msan_interceptors.cpp
-@@ -909,11 +909,23 @@ INTERCEPTOR(int, __getrlimit, int resource, void *rlim) {
+@@ -909,11 +909,28 @@ INTERCEPTOR(int, __getrlimit, int resource, void *rlim) {
    INTERCEPTOR_GETRLIMIT_BODY(__getrlimit, resource, rlim);
  }
  
@@ -41,31 +45,36 @@ index 76255cd..52cd2b3 100644
 +// only for glibc.  Referencing it on musl is an undefined symbol that fails the
 +// link of any program that pulls these interceptors in.  musl's one size is the
 +// right one for both, so use struct_rlimit_sz there.  Mirrors how 0004-0011
-+// substitute musl's layout for glibc's where the two differ.
++// substitute musl's layout for glibc's where the two differ.  A function rather
++// than a constant: both sizes are extern variables, so a namespace-scope
++// constant initialized from one would be a dynamic initializer, a global
++// constructor in a runtime that has none.
++static uptr RlimitSize64() {
 +#if SANITIZER_MUSL
-+static const uptr kMsanRlimit64Sz = __sanitizer::struct_rlimit_sz;
++  return __sanitizer::struct_rlimit_sz;
 +#else
-+static const uptr kMsanRlimit64Sz = __sanitizer::struct_rlimit64_sz;
++  return __sanitizer::struct_rlimit64_sz;
 +#endif
++}
 +
  INTERCEPTOR(int, getrlimit64, int resource, void *rlim) {
    if (msan_init_is_running) return REAL(getrlimit64)(resource, rlim);
    ENSURE_MSAN_INITED();
    int res = REAL(getrlimit64)(resource, rlim);
 -  if (!res) __msan_unpoison(rlim, __sanitizer::struct_rlimit64_sz);
-+  if (!res) __msan_unpoison(rlim, kMsanRlimit64Sz);
++  if (!res) __msan_unpoison(rlim, RlimitSize64());
    return res;
  }
  
-@@ -933,9 +945,9 @@ INTERCEPTOR(int, prlimit64, int pid, int resource, void *new_rlimit,
+@@ -933,9 +950,9 @@ INTERCEPTOR(int, prlimit64, int pid, int resource, void *new_rlimit,
    if (msan_init_is_running)
      return REAL(prlimit64)(pid, resource, new_rlimit, old_rlimit);
    ENSURE_MSAN_INITED();
 -  CHECK_UNPOISONED(new_rlimit, __sanitizer::struct_rlimit64_sz);
-+  CHECK_UNPOISONED(new_rlimit, kMsanRlimit64Sz);
++  CHECK_UNPOISONED(new_rlimit, RlimitSize64());
    int res = REAL(prlimit64)(pid, resource, new_rlimit, old_rlimit);
 -  if (!res) __msan_unpoison(old_rlimit, __sanitizer::struct_rlimit64_sz);
-+  if (!res) __msan_unpoison(old_rlimit, kMsanRlimit64Sz);
++  if (!res) __msan_unpoison(old_rlimit, RlimitSize64());
    return res;
  }
  

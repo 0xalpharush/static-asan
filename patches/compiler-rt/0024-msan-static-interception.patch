@@ -1,4 +1,4 @@
-From 962e5a12d2b18f2180bc7c32e7e86582886bc30f Mon Sep 17 00:00:00 2001
+From ada33757ceeb9e21af867fdfa890977950346a65 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:00:00 +0000
 Subject: [PATCH] [compiler-rt] msan: attach interceptors at link time like
@@ -13,8 +13,8 @@ __wrap_<func>, reached through __real_<func>, so a fully static musl link can
 attach them with ld --wrap instead of the dlsym interception that needs a
 dynamic loader; lib/asan/CMakeLists.txt appends SANITIZER_STATIC_INTERCEPTION=1
 to asan's definitions and calls add_sanitizer_rt_wrap_list for clang_rt.asan,
-and asan_rtl.cpp references __asan_wrap_list_present so a link that forgets the
-response file fails rather than producing a binary with every interceptor
+and AsanInitInternal references __asan_wrap_list_present so a link that forgets
+the response file fails rather than producing a binary with every interceptor
 silently detached.  msan got none of this, so libclang_rt.msan.a -- which the
 build already produces on the arches compiler-rt supports msan on -- carried
 dlsym-based interceptors that do nothing in a static binary and had no wrap
@@ -31,27 +31,62 @@ This gives msan the same three pieces:
     add_sanitizer_rt_wrap_list(clang_rt.msan), installed as
     libclang_rt.msan.a.wrap.
 
-  - gen_wrap_list.py names the present-symbol after the archive it reads rather
-    than hardcoding asan's, so clang_rt.msan's list defines
-    __msan_wrap_list_present and clang_rt.asan's still defines
-    __asan_wrap_list_present.  One runtime's wrap file can no longer stand in
-    for another's.
+  - The present-symbol is per runtime.  add_sanitizer_rt_wrap_list derives it
+    from the target name it is given (clang_rt.asan -> __asan_wrap_list_present,
+    clang_rt.msan -> __msan_wrap_list_present) and passes it to gen_wrap_list.py
+    as --present-symbol, where it used to be a constant in the script.  One
+    runtime's wrap file can no longer stand in for another's.  asan's list is
+    byte-identical: the same symbol, now passed rather than hardcoded.
 
-  - msan.cpp references __msan_wrap_list_present under
-    SANITIZER_STATIC_INTERCEPTION, so a static-intercepting msan link without
-    the response file is an undefined symbol at link time, exactly as it is for
-    asan.
+  - __msan_init references __msan_wrap_list_present under
+    SANITIZER_STATIC_INTERCEPTION, with the empty asm AsanInitInternal uses, so
+    a static-intercepting msan link without the response file is an undefined
+    symbol at link time, exactly as it is for asan.  The reference is in code
+    and not in a static holding the address: such a static is a data section
+    nothing refers to, and --gc-sections, which both MSan configs pass, discards
+    it before the linker looks for the symbol.
 
 Nothing changes for a non-static-interception build: the define is absent, the
 reference compiles out, and the wrap-list target is not created.
----
- compiler-rt/lib/msan/CMakeLists.txt           | 19 +++++++++++++++++++
- compiler-rt/lib/msan/msan.cpp                 | 14 ++++++++++++++
- .../sanitizer_common/scripts/gen_wrap_list.py | 19 ++++++++++++++++---
- 3 files changed, 49 insertions(+), 3 deletions(-)
 
+Measured, x86_64, with the toolchain image built from this series: a link of a
+small program against the statically intercepting resource dir with
+-fsanitize=memory -static -Wl,--gc-sections and no wrap list fails with
+`undefined symbol: __msan_wrap_list_present`; the same link with the list
+succeeds and the program runs.
+---
+ .../cmake/Modules/SanitizerUtils.cmake        |  6 +++++
+ compiler-rt/lib/msan/CMakeLists.txt           | 19 +++++++++++++
+ compiler-rt/lib/msan/msan.cpp                 | 26 ++++++++++++++++++
+ .../sanitizer_common/scripts/gen_wrap_list.py | 27 ++++++++++++-------
+ 4 files changed, 68 insertions(+), 10 deletions(-)
+
+diff --git a/compiler-rt/cmake/Modules/SanitizerUtils.cmake b/compiler-rt/cmake/Modules/SanitizerUtils.cmake
+index 76d056ec0..7f174bee9 100644
+--- a/compiler-rt/cmake/Modules/SanitizerUtils.cmake
++++ b/compiler-rt/cmake/Modules/SanitizerUtils.cmake
+@@ -72,6 +72,11 @@ macro(add_sanitizer_rt_wrap_list name)
+     "PARENT_TARGET"
+     "ARCHS"
+     ${ARGN})
++  # The symbol the response file defines and the runtime references, named after
++  # the runtime: clang_rt.asan -> __asan_wrap_list_present, clang_rt.msan ->
++  # __msan_wrap_list_present.
++  string(REGEX REPLACE "^clang_rt\\." "" wrap_list_runtime "${name}")
++  set(wrap_list_present_symbol "__${wrap_list_runtime}_wrap_list_present")
+   foreach(arch ${ARG_ARCHS})
+     set(target_name ${name}-${arch})
+     # The output is $<TARGET_FILE:${target_name}>.wrap, but a target-dependent
+@@ -86,6 +91,7 @@ macro(add_sanitizer_rt_wrap_list name)
+       COMMAND ${Python3_EXECUTABLE}
+         ${SANITIZER_GEN_WRAP_LIST} $<TARGET_FILE:${target_name}>
+         --nm-executable "${SANITIZER_NM}" ${available_args}
++        --present-symbol ${wrap_list_present_symbol}
+         -o $<TARGET_FILE:${target_name}>.wrap
+       COMMAND ${CMAKE_COMMAND} -E touch ${stamp}
+       DEPENDS ${target_name} ${SANITIZER_GEN_WRAP_LIST}
 diff --git a/compiler-rt/lib/msan/CMakeLists.txt b/compiler-rt/lib/msan/CMakeLists.txt
-index a0b9c61..ce44b16 100644
+index a0b9c6158..ce44b16a4 100644
 --- a/compiler-rt/lib/msan/CMakeLists.txt
 +++ b/compiler-rt/lib/msan/CMakeLists.txt
 @@ -42,6 +42,15 @@ endif()
@@ -88,10 +123,10 @@ index a0b9c61..ce44b16 100644
  
  add_compiler_rt_resource_file(msan_ignorelist msan_ignorelist.txt msan)
 diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
-index 6c27ab2..b34d3d5 100644
+index 6c27ab21e..9a3ead077 100644
 --- a/compiler-rt/lib/msan/msan.cpp
 +++ b/compiler-rt/lib/msan/msan.cpp
-@@ -35,6 +35,20 @@
+@@ -35,6 +35,26 @@
  
  using namespace __sanitizer;
  
@@ -105,53 +140,90 @@ index 6c27ab2..b34d3d5 100644
 +// and no diagnostic anywhere.  The response file defines this symbol, so that
 +// leaving it out is an undefined symbol at link time instead.  Mirrors
 +// asan_rtl.cpp's __asan_wrap_list_present.
++//
++// The reference is made from __msan_init() below rather than held in a static
++// object, for the reason asan_rtl.cpp gives: a static holding the address is a
++// data section nothing refers to, and a link with --gc-sections -- which both
++// MSan configs pass -- discards it before it looks for the symbol, so the link
++// succeeds and produces the detached binary this exists to refuse.  A use in
++// the one function every MSan binary runs cannot be discarded.
 +extern "C" char __msan_wrap_list_present;
-+static char *const kMsanWrapListPresent USED = &__msan_wrap_list_present;
 +#endif
 +
  // Globals.
  static THREADLOCAL int msan_expect_umr = 0;
  static THREADLOCAL int msan_expected_umr_found = 0;
+@@ -447,6 +467,12 @@ void __msan_init() {
+   msan_init_is_running = 1;
+   SanitizerToolName = "MemorySanitizer";
+ 
++#if SANITIZER_STATIC_INTERCEPTION
++  // The wrap list's presence, as an undefined symbol in live code; see the
++  // declaration above.  The asm takes the address and does nothing with it.
++  __asm__ __volatile__("" : : "r"(&__msan_wrap_list_present));
++#endif
++
+   AvoidCVE_2016_2143();
+ 
+   CacheBinaryName();
 diff --git a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
-index 9fd0ebf..1a91e49 100755
+index 8989c0bbe..3ffc8a80b 100755
 --- a/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
 +++ b/compiler-rt/lib/sanitizer_common/scripts/gen_wrap_list.py
-@@ -33,14 +33,27 @@
+@@ -25,13 +25,18 @@
+ # behind them are listed.
+ #
+ # The output format is a linker response file: one --wrap=<func> per line,
+-# usable as -Wl,@<file>.  Its first line defines __asan_wrap_list_present, which
+-# the runtime references: a link that leaves the response file out would
+-# otherwise succeed and produce a program with every interceptor detached, since
+-# nothing in it refers to a __wrap_ name.
++# usable as -Wl,@<file>.  Its first line defines the symbol named by
++# --present-symbol, which the runtime references: a link that leaves the
++# response file out would otherwise succeed and produce a program with every
++# interceptor detached, since nothing in it refers to a __wrap_ name.  Each
++# runtime has its own symbol -- __asan_wrap_list_present for
++# libclang_rt.asan.a, __msan_wrap_list_present for libclang_rt.msan.a -- so one
++# runtime's list cannot stand in for another's.  add_sanitizer_rt_wrap_list in
++# SanitizerUtils.cmake passes it, derived from the runtime's target name.
+ #
+ # Usage:
+-#   gen_wrap_list.py libclang_rt.asan.a --available libc.a -o libclang_rt.asan.a.wrap
++#   gen_wrap_list.py libclang_rt.asan.a --present-symbol __asan_wrap_list_present \
++#       --available libc.a -o libclang_rt.asan.a.wrap
  #
  # ===------------------------------------------------------------------------===#
  import argparse
-+import os
-+import re
- import subprocess
- import sys
+@@ -40,10 +45,6 @@ import sys
  
  PREFIX = "__wrap_"
  
-+
- # Defined by the response file and referenced by the runtime, so that a link
+-# Defined by the response file and referenced by the runtime, so that a link
 -# without the response file fails instead of detaching every interceptor.
 -PRESENT_SYMBOL = "__asan_wrap_list_present"
-+# without the response file fails instead of detaching every interceptor.  It is
-+# named after the runtime the list is for -- __asan_wrap_list_present for
-+# libclang_rt.asan.a, __msan_wrap_list_present for libclang_rt.msan.a -- so one
-+# runtime's wrap file cannot stand in for another's, and so the symbol each
-+# runtime references is the one its own list defines.  asan is unchanged: its
-+# archive still yields __asan_wrap_list_present.
-+def present_symbol(library):
-+    base = os.path.basename(library)
-+    m = re.match(r"libclang_rt\.([a-z0-9]+)", base)
-+    if not m:
-+        raise RuntimeError("cannot derive a sanitizer name from %s" % base)
-+    return "__%s_wrap_list_present" % m.group(1)
- 
+-
  # A floor on how much of the runtime's interception survives intersecting it with
  # --available.  The libraries named there are meant to be the ones the link will
-@@ -111,7 +124,7 @@ def main():
+ # provide, and a libc defines nearly all of what a sanitizer intercepts; a
+@@ -75,6 +76,12 @@ def main():
+     parser.add_argument("library", help="static sanitizer runtime to read")
+     parser.add_argument("-o", "--output", required=True, help="output file")
+     parser.add_argument("--nm-executable", required=True, help="path to nm")
++    parser.add_argument(
++        "--present-symbol",
++        required=True,
++        help="the symbol the response file defines and the runtime references, "
++        "so that a link without the response file fails",
++    )
+     parser.add_argument(
+         "--available",
+         action="append",
+@@ -113,7 +120,7 @@ def main():
          return 1
  
      with open(args.output, "w") as f:
 -        f.write("--defsym=%s=1\n" % PRESENT_SYMBOL)
-+        f.write("--defsym=%s=1\n" % present_symbol(args.library))
++        f.write("--defsym=%s=1\n" % args.present_symbol)
          for name in sorted(names):
              f.write("--wrap=%s\n" % name)
      return 0

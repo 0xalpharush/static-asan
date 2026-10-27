@@ -1,4 +1,4 @@
-From 38e10e57f31bfdd40ac4c5cb6fdf1f464cab58e5 Mon Sep 17 00:00:00 2001
+From e0a844c0dde12b38629aaeadfbb78fc106aa0873 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:05:00 +0000
 Subject: [PATCH] [compiler-rt] sealed init: record __msan_init's frame
@@ -15,18 +15,33 @@ What that costs: GetThreadStackTopAndBottom reads sealed_init_frame as the top
 of the sealed main-thread stack window; with it 0 the window top falls back to
 the frame of the reader, which is below SetThreadStackAndTls's frame, and
 CHECK(AddrIsInStack(&local)) in msan_thread.cpp fails on the runs where the
-reader's frame lands low enough.  The maintainers measured it: 5 of 80 sealed
-runs failed that CHECK without this, 0 of 80 with it.
+reader's frame lands low enough.
 
 Taken at the top of __msan_init, above every frame that will be compared
 against it, with a local whose address is the bound.  Mirrors __asan_init; a
 store of a constant in an unsealed run, so an ordinary MSan build is unchanged.
+
+sanitizer_sealed.h's comments still say that __asan_init is what records the
+frame.  They are left stale on purpose: sanitizer_sealed.h is a shared header,
+and even a comment edit there moves line numbers in the .debug_line of every
+ASan object that includes it, which changes libclang_rt.asan.a and the md5 of
+it that README.md records.  This series changes no shared source.
+
+Measured, x86_64, Linux 6.8, ASLR on (vm.mmap_rnd_bits=28), the sealed clean and
+uninitialized-read programs of the Dockerfile's MSan check, 80 runs each.  With
+this series but the SealedSetInitFrame call removed: 6 of 80 and 6 of 80 runs
+died on
+
+  MemorySanitizer: CHECK failed: msan_thread.cpp:26 "((AddrIsInStack((uptr)&local))) != (0)"
+
+With the call: 0 of 80 and 0 of 80, and 0 of 40 and 0 of 40 again with
+vm.mmap_rnd_bits=32.
 ---
- compiler-rt/lib/msan/msan.cpp | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
+ compiler-rt/lib/msan/msan.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
 
 diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
-index b34d3d5..ca86454 100644
+index 9a3ead077..161a8d708 100644
 --- a/compiler-rt/lib/msan/msan.cpp
 +++ b/compiler-rt/lib/msan/msan.cpp
 @@ -25,6 +25,7 @@
@@ -37,16 +52,17 @@ index b34d3d5..ca86454 100644
  #include "sanitizer_common/sanitizer_stackdepot.h"
  #include "sanitizer_common/sanitizer_stacktrace.h"
  #include "sanitizer_common/sanitizer_symbolizer.h"
-@@ -461,6 +462,18 @@ void __msan_init() {
-   msan_init_is_running = 1;
-   SanitizerToolName = "MemorySanitizer";
+@@ -473,6 +474,19 @@ void __msan_init() {
+   __asm__ __volatile__("" : : "r"(&__msan_wrap_list_present));
+ #endif
  
 +  // Record the frame __msan_init started on, for sealed init, exactly as
 +  // AsanInitInternal does right after it sets SanitizerToolName.  Sealed mode
 +  // describes the main thread's stack from a recorded frame rather than reading
-+  // /proc/self/maps for it (see sanitizer_sealed.h): the window ends at this
-+  // frame.  Its top is what MsanThread::Init checks the stack against -- without
-+  // this, sealed_init_frame stays 0, the window top falls back to the frame of
++  // /proc/self/maps for it (see sanitizer_sealed.h, whose comments still name
++  // only __asan_init as the recorder): the window ends at this frame.  Its top
++  // is what MsanThread::Init checks the stack against -- without this,
++  // sealed_init_frame stays 0, the window top falls back to the frame of
 +  // whoever reads it, and CHECK(AddrIsInStack(&local)) in msan_thread.cpp fails
 +  // on the runs where that frame sits below the real one.  Taken here, above
 +  // every frame compared against it; a store of a constant in an unsealed run.

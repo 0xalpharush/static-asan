@@ -44,12 +44,16 @@
 # none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
 # section of README.md.
 #
-# The three steps at the end run binaries for the target.  On a native build that
-# is nothing to arrange; on a cross build the machine has to be able to execute
-# them, which on Linux means binfmt_misc with qemu-user registered -- `docker run
-# --privileged tonistiigi/binfmt --install <arch>` once per boot, or
-# docker/setup-qemu-action in CI.  Only these three steps need it.  Nothing the
-# image is for does.
+# The four steps at the end run binaries for the target; the fourth, the
+# MemorySanitizer test, only on x86_64 and aarch64, the targets with an msan
+# runtime.  On a native build that is nothing to arrange; on a cross build the
+# machine has to be able to execute them, which on Linux means binfmt_misc with
+# qemu-user registered -- `docker run --privileged tonistiigi/binfmt --install
+# <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these four
+# steps need it.  Nothing the image is for does.  MSan cannot run under
+# qemu-user at all (qemu places the guest stack inside MSan's fixed ranges), so
+# the MSan step detects emulation and records its runs as not verified instead
+# of running them; see that step.
 #
 # Sources are taken from the mounted checkouts at their pinned base commits with
 # git archive, unpacked into the image and patched there, so the patch series is
@@ -90,7 +94,7 @@
 #                                      with libclang_rt.msan.a.wrap.  Emitted only
 #                                      on the targets whose msan runtime the build
 #                                      produced (x86_64, aarch64); the other
-#                                      targets have none -- see section 5
+#                                      targets have none -- see section 5b
 #   /opt/asan-static/msan-musl-sealed.cfg
 #                                      clang config: the same static MSan link
 #                                      with sealed init turned on.  Same runtime
@@ -1022,7 +1026,6 @@ RUN set -eu; \
       "-fuse-ld=lld" \
       "-fsanitize=memory" \
       "-static" \
-      "-no-pie" \
       "-Wl,--gc-sections" \
       "-Wl,--no-warn-backrefs" \
       "-Wl,@$mwrap" \
@@ -1041,7 +1044,6 @@ RUN set -eu; \
       "-fuse-ld=lld" \
       "-fsanitize=memory" \
       "-static" \
-      "-no-pie" \
       "-Wl,--gc-sections" \
       "-Wl,--no-warn-backrefs" \
       "-Wl,@$mwrap" \
@@ -1196,41 +1198,73 @@ RUN set -eu; \
     grep -q "__asan_wrap_list_present" /tmp/detached.log; \
     echo "a link without the wrap list fails"
 
-# MemorySanitizer smoke test, on the targets that have an msan runtime.  The
-# plain runs follow the ASan attach check above: run under `|| true | tee` and
-# classify by grepping the log -- the success/report signal present is a pass, a
-# known environment-specific CHECK failure present is a skip, and neither is a
-# build failure.  They do not assert an exit code, because a plain msan binary
-# re-execs at start-up and the exit status then depends on the sandbox, not the
-# toolchain.  The sealed runs are the strict deterministic gate (no ReExec),
-# checked by exit code.  Two programs, each built with msan-musl.cfg and
-# msan-musl-sealed.cfg:
+# MemorySanitizer test, on the targets that have an msan runtime (x86_64 and
+# aarch64; on the others section 5b wrote no msan config and this step says so
+# and does nothing).
 #
-#   clean -- fully initialized heap, a wrapped fopen/fread/fclose, printf.  Prints
-#            its success line "msan ok".  This is what exercises the sealed-init
-#            frame (before it the sealed binary failed AddrIsInStack) and the musl
-#            FILE gate (before it fclose faulted in unpoison_file).  Plain: the
-#            line present is a pass.  Sealed: must exit 0 with the line.
-#   umr   -- branches on an uninitialized heap value.  Must report
-#            use-of-uninitialized-value.  Plain: the report present is a pass.
-#            Sealed: the report plus death by SIGABRT (exit 134, the sealed
-#            contract).  A report proves interception and instrumentation are live.
+# Two programs, each linked with msan-musl.cfg (plain) and msan-musl-sealed.cfg
+# (sealed), so four binaries:
 #
-# A negative link test links the clean program against the static-intercepting
-# resource dir WITHOUT the wrap list: it must fail on __msan_wrap_list_present,
-# which proves the list is load-bearing rather than incidental.
+#   clean -- a fully initialized heap block, a wrapped fopen/fread/fclose and a
+#            printf.  A pass is exit 0 with its line "msan ok <n>".  The FILE
+#            calls are what reach unpoison_file (patch 0028), and the sealed
+#            binary's start-up is what reads the recorded init frame (0026).
+#   umr   -- branches on an uninitialized heap value.  A pass is MSan's
+#            use-of-uninitialized-value report and death: by exit status 1 (the
+#            common exitcode flag, which MSan leaves at its default) when plain,
+#            by SIGABRT (134) when sealed (abort_on_error is pinned, patch
+#            0027).  The report proves interception and
+#            instrumentation are live.
 #
-# A missing runtime (a target with no msan in compiler-rt 20.1.8) skips the whole
-# step.  The plain runs also skip -- the way the ASan check defers a constrained
-# address space -- on two environment effects that do not touch the sealed path:
-# the re-exec's personality(ADDR_NO_RANDOMIZE) refused by a sandbox's default
-# seccomp profile (CHECK failed: msan_linux.cpp), and a too-small RLIMIT_AS that
-# fails the TBs of shadow an msan process reserves.  A plain run that fails for
-# any other reason -- a missing interceptor, no report, wrong output -- still
-# fails the build.  The sealed binary never re-execs, so it keeps the strict
-# exit-code gate; only its spin under a set RLIMIT_AS (patch 0015) is deferred.
+# Each binary is run MSAN_RUNS times, under `timeout -s KILL`, and every run is
+# classified by one function, msan_check.  The image's timeout is busybox's: it
+# kills the program itself, so the shell sees 128+signal -- 137 for KILL -- and
+# never 124.  A run's outcome is one of:
+#
+#   pass      as above.
+#   spin      sealed only: killed by the timeout (137) having printed nothing
+#             (the log holds at most the shell's own "Killed").
+#             MSan's x86_64 and aarch64 layouts have fixed shadow, origin and
+#             allocator ranges, and a sealed runtime that finds one of the
+#             kernel's start-up mappings inside them spins rather than re-exec
+#             (README.md, "Known limitation").  With full ASLR that is a share
+#             of runs, not all of them.
+#   re-exec   plain only: the plain runtime answers the same conflict by
+#             re-execing with ASLR off, and in a RUN step the default seccomp
+#             profile refuses its personality(ADDR_NO_RANDOMIZE), which MSan
+#             reports as one CHECK, matched here by its full text (the
+#             condition as printed, with musl's ADDR_NO_RANDOMIZE expanded):
+#               MemorySanitizer: CHECK failed: msan_linux.cpp:<line>
+#               "((personality(old_personality | 0x0040000))) != ((-1))"
+#   as-limit  MSan's own "can not mmap the shadow" / "Cannot protect memory
+#             range", accepted only when this build's RLIMIT_AS is not
+#             unlimited -- the shadow is TBs.
+#
+# Anything else -- another signal, another exit status, a report missing or
+# where none belongs, a CHECK other than that one -- fails the build at once.
+# And at least one run of each binary must pass: with a spin or re-exec share
+# of about one in four, twelve runs that all miss happen about once in 17
+# million builds.  Only when no run passed AND the build's RLIMIT_AS is set
+# AND the misses were the address-space kind (as-limit, or a sealed spin,
+# which is what a refused reservation looks like) is the miss a property of
+# the machine rather than the toolchain; that goes through VERIFY_RUNTIME
+# exactly as the ASan check above does: "require" fails the build saying so,
+# "defer" appends what was not verified to /opt/asan-static/RUNTIME-UNVERIFIED.
+#
+# MSan does not run under qemu-user at all: on aarch64 qemu-user puts the guest
+# stack inside MSan's origin range, and both the plain and the sealed runs fail.
+# So the step first runs a static probe and reads /proc/<pid>/exe from outside
+# it: natively that is the probe itself, under binfmt_misc it is the emulator.
+# Under emulation nothing is run, nothing is reported as passing, and the step
+# appends to RUNTIME-UNVERIFIED that MSan was not verified.  CI builds aarch64
+# on a native arm64 runner, so CI runs these binaries for real.
+#
+# Last, a negative link: the clean program against the statically intercepting
+# resource dir, with --gc-sections as both MSan configs pass it, and WITHOUT the
+# wrap list.  It must fail on __msan_wrap_list_present (patch 0024).
+ARG MSAN_RUNS=12
 RUN set -eu; \
-    [ -f /opt/asan-static/msan-musl.cfg ] || { echo "no msan config for $TRIPLE; skipping msan smoke test"; exit 0; }; \
+    [ -f /opt/asan-static/msan-musl.cfg ] || { echo "no msan config for $TRIPLE; no msan test"; exit 0; }; \
     printf '%s\n' \
       '#include <stdio.h>' \
       '#include <stdlib.h>' \
@@ -1240,7 +1274,7 @@ RUN set -eu; \
       '  unsigned long s = 0; for (int i = 0; i < 64; i++) s += (unsigned char)d[i];' \
       '  FILE *f = fopen("/tmp/msan_clean.c", "rb");' \
       '  if (f) { char b[32]; size_t n = fread(b, 1, sizeof b, f); for (size_t i = 0; i < n; i++) s += (unsigned char)b[i]; fclose(f); }' \
-      '  printf("msan ok %lu\\n", s); free(d); return 0;' \
+      '  printf("msan ok %lu\n", s); free(d); return 0;' \
       '}' \
       > /tmp/msan_clean.c; \
     printf '%s\n' \
@@ -1248,8 +1282,8 @@ RUN set -eu; \
       '#include <stdlib.h>' \
       'int main(void){' \
       '  volatile int *p = (volatile int *)malloc(sizeof(int));  /* uninitialized */' \
-      '  int r = *p ? 1 : 2;  /* branch on uninitialized value: MSan must report */' \
-      '  printf("%d\\n", r); free((void *)p); return 0;' \
+      '  int r = *p ? 1 : 2;  /* branch on an uninitialized value: MSan must report */' \
+      '  printf("%d\n", r); free((void *)p); return 0;' \
       '}' \
       > /tmp/msan_umr.c; \
     clang --config=/opt/asan-static/msan-musl.cfg        -g /tmp/msan_clean.c -o /tmp/msan_clean; \
@@ -1259,54 +1293,78 @@ RUN set -eu; \
     echo "msan configs link"; \
     if clang --target="$TRIPLE" --sysroot="$SYSROOT" -resource-dir="$STATIC_RESOURCE_DIR" \
          --rtlib=compiler-rt --unwindlib=libunwind -fuse-ld=lld -fsanitize=memory -static \
-         /tmp/msan_clean.c -o /tmp/msan_detached 2>/tmp/msan_detached.log; then \
+         -Wl,--gc-sections /tmp/msan_clean.c -o /tmp/msan_detached 2>/tmp/msan_detached.log; then \
       echo "an msan link without the wrap list succeeded; the interceptors are detached" >&2; exit 1; \
     fi; \
     grep -q "__msan_wrap_list_present" /tmp/msan_detached.log \
-      || { echo "the msan wrap-list link failed for the wrong reason:" >&2; cat /tmp/msan_detached.log >&2; exit 1; }; \
-    echo "an msan link without the wrap list fails"; \
+      || { echo "the msan link without the wrap list failed for another reason:" >&2; cat /tmp/msan_detached.log >&2; exit 1; }; \
+    echo "an msan link without the wrap list fails, with --gc-sections"; \
+    unverified() { \
+      printf '%s\n' "" "MemorySanitizer: $1 was not verified when this image was built." "$2" \
+        "Nothing has shown that msan-musl.cfg and msan-musl-sealed.cfg work in this" \
+        "image.  Run binaries linked with them natively, under an RLIMIT_AS that is" \
+        "not small, before trusting them." >> /opt/asan-static/RUNTIME-UNVERIFIED; \
+      echo "msan: $1 NOT verified: see /opt/asan-static/RUNTIME-UNVERIFIED"; \
+    }; \
+    printf 'int main(void){for(;;);}\n' > /tmp/msan_probe.c; \
+    clang --config=/opt/asan-static/musl.cfg /tmp/msan_probe.c -o /tmp/msan_probe; \
+    /tmp/msan_probe & probe=$!; sleep 1; \
+    probe_exe=$(readlink "/proc/$probe/exe" || true); kill -9 "$probe"; wait "$probe" 2>/dev/null || true; \
+    if [ "$probe_exe" != /tmp/msan_probe ]; then \
+      echo "msan: target binaries run through $probe_exe, not natively; MSan does not run under emulation" >&2; \
+      unverified "every run (clean and umr, plain and sealed)" \
+        "The build ran the target's binaries through $probe_exe (binfmt_misc emulation), under which MSan's fixed layout does not hold, so none was run."; \
+      exit 0; \
+    fi; \
     ulimit -v unlimited 2>/dev/null || true; \
     vlimit=$(ulimit -v); \
-    defer="can not mmap the shadow|is not available|Cannot protect memory range"; \
-    reexec="CHECK failed: msan_linux.cpp"; \
-    { /tmp/msan_clean 2>&1 || true; } | tee /tmp/msan_clean.log; \
-    if grep -q "msan ok" /tmp/msan_clean.log; then \
-      echo "clean/plain: reports success"; \
-    elif grep -qF "$reexec" /tmp/msan_clean.log; then \
-      echo "clean/plain: re-exec refused by the sandbox (personality under seccomp); skipped" >&2; \
-    elif grep -qE "$defer" /tmp/msan_clean.log; then \
-      echo "clean/plain: shadow reservation failed (constrained address space); skipped" >&2; \
-    else \
-      echo "clean/plain: neither the success line nor a known environment limit is present:" >&2; cat /tmp/msan_clean.log >&2; exit 1; \
-    fi; \
-    { /tmp/msan_umr 2>&1 || true; } | tee /tmp/msan_umr.log; \
-    if grep -q "use-of-uninitialized-value" /tmp/msan_umr.log; then \
-      echo "umr/plain: reports"; \
-    elif grep -qF "$reexec" /tmp/msan_umr.log; then \
-      echo "umr/plain: re-exec refused by the sandbox (personality under seccomp); skipped" >&2; \
-    elif grep -qE "$defer" /tmp/msan_umr.log; then \
-      echo "umr/plain: constrained address space; skipped" >&2; \
-    else \
-      echo "umr/plain: no report and no known environment limit:" >&2; cat /tmp/msan_umr.log >&2; exit 1; \
-    fi; \
-    rc=0; timeout 60 /tmp/msan_clean_sealed > /tmp/msan_clean_sealed.log 2>&1 || rc=$?; cat /tmp/msan_clean_sealed.log; \
-    if [ "$rc" -eq 0 ] && grep -q "msan ok" /tmp/msan_clean_sealed.log; then \
-      echo "clean/sealed: exit 0"; \
-    elif [ "$rc" -eq 124 ] && [ "$vlimit" != unlimited ]; then \
-      echo "clean/sealed: timed out under RLIMIT_AS ${vlimit}KB (sealed spin); deferred" >&2; \
-    else \
-      echo "clean/sealed failed (rc=$rc):" >&2; cat /tmp/msan_clean_sealed.log >&2; exit 1; \
-    fi; \
-    rc=0; timeout 60 /tmp/msan_umr_sealed > /tmp/msan_umr_sealed.log 2>&1 || rc=$?; cat /tmp/msan_umr_sealed.log; \
-    if grep -q "use-of-uninitialized-value" /tmp/msan_umr_sealed.log; then \
-      [ "$rc" -eq 134 ] || { echo "umr/sealed reported but did not die by SIGABRT (rc=$rc)" >&2; exit 1; }; \
-      echo "umr/sealed: reports and aborts (SIGABRT)"; \
-    elif [ "$rc" -eq 124 ] && [ "$vlimit" != unlimited ]; then \
-      echo "umr/sealed: timed out under RLIMIT_AS ${vlimit}KB (sealed spin); deferred" >&2; \
-    else \
-      echo "umr/sealed did not report/abort (rc=$rc):" >&2; cat /tmp/msan_umr_sealed.log >&2; exit 1; \
-    fi; \
-    echo "msan: plain clean/umr classified by log (ASan idiom), sealed clean exits 0 and sealed umr aborts (SIGABRT), wrap list load-bearing"
+    reexec_re='MemorySanitizer: CHECK failed: msan_linux\.cpp:[0-9]+ "\(\(personality\(old_personality \| 0x0040000\)\)\) != \(\(-1\)\)"'; \
+    aslimit_re='FATAL: MemorySanitizer can not mmap the shadow memory|FATAL: MemorySanitizer: Cannot protect memory range'; \
+    msan_check() { \
+      label=$1 bin=$2 prog=$3 mode=$4; \
+      n=0 pass=0 spin=0 reexec=0 aslim=0; \
+      while [ "$n" -lt "$MSAN_RUNS" ]; do \
+        n=$((n + 1)); rc=0; \
+        timeout -s KILL 10 "$bin" > /tmp/msan_run.log 2>&1 || rc=$?; \
+        if [ "$prog" = clean ] && [ "$rc" -eq 0 ] && grep -qx "msan ok [0-9]*" /tmp/msan_run.log; then \
+          pass=$((pass + 1)); \
+        elif [ "$prog" = umr ] && [ "$rc" -eq "$([ "$mode" = sealed ] && echo 134 || echo 1)" ] \
+             && grep -q "WARNING: MemorySanitizer: use-of-uninitialized-value" /tmp/msan_run.log; then \
+          pass=$((pass + 1)); \
+        elif [ "$mode" = sealed ] && [ "$rc" -eq 137 ] && ! grep -qvx Killed /tmp/msan_run.log; then \
+          spin=$((spin + 1)); \
+        elif [ "$mode" = plain ] && grep -qE "$reexec_re" /tmp/msan_run.log; then \
+          reexec=$((reexec + 1)); \
+        elif [ "$vlimit" != unlimited ] && grep -qE "$aslimit_re" /tmp/msan_run.log; then \
+          aslim=$((aslim + 1)); \
+        else \
+          echo "$label: run $n of $MSAN_RUNS ended with status $rc, which is neither a pass nor a known miss:" >&2; \
+          cat /tmp/msan_run.log >&2; exit 1; \
+        fi; \
+      done; \
+      echo "$label: $n runs: $pass passed, $spin spun (sealed), $reexec re-exec refused (plain), $aslim address-space limit"; \
+      [ "$pass" -gt 0 ] && return 0; \
+      if [ "$vlimit" = unlimited ] || [ $((spin + aslim)) -eq 0 ]; then \
+        echo "$label: no run of $MSAN_RUNS passed, and a constrained address space is not why" >&2; exit 1; \
+      fi; \
+      printf '%s\n' "" \
+        "  No run of $label passed, so whether MemorySanitizer works in it has not" \
+        "  been tested either way.  This build's address space limit is ${vlimit}KB;" \
+        "  MSan's shadow is TBs, a sealed MSan binary spins when its reservation is" \
+        "  refused, and a plain one cannot map its shadow.  A container inherits" \
+        "  RLIMIT_AS from the daemon: see the ASan check's message above for how to" \
+        "  lift it." "" >&2; \
+      if [ "$VERIFY_RUNTIME" != defer ]; then \
+        printf '%s\n' "  To build the image anyway:  --build-arg VERIFY_RUNTIME=defer" "" >&2; \
+        exit 1; \
+      fi; \
+      unverified "$label" "The build ran under an RLIMIT_AS of ${vlimit}KB and no run of it passed: $spin spun, $aslim could not map the shadow."; \
+    }; \
+    msan_check clean/plain  /tmp/msan_clean        clean plain; \
+    msan_check umr/plain    /tmp/msan_umr          umr   plain; \
+    msan_check clean/sealed /tmp/msan_clean_sealed clean sealed; \
+    msan_check umr/sealed   /tmp/msan_umr_sealed   umr   sealed; \
+    echo "msan: every run passed or missed in a known way"
 
 ENV MUSL_SYSROOT=$SYSROOT \
     ASAN_RESOURCE_DIR=$RESOURCE_DIR
