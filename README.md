@@ -259,8 +259,14 @@ cannot be a trap in clang, because its decision reads the object's RTTI. The con
 `/opt/ubsan-vptr-trap/libclang_rt.ubsan_vptr_trap.a`, which defines only the handler that the
 checks call and the cache that they read. The handler makes compiler-rt's decision and then,
 on a mismatch, executes the trap instruction, so a bad downcast or a member call on an object of
-another dynamic type ends as a trap-mode check does. It does not check that the vtable it
-reads is mapped, which compiler-rt does. Code compiled with `-fno-rtti` gets no vptr check.
+another dynamic type ends as a trap-mode check does. Before it reads the vtable, the type
+information and the base-class lists, it checks that each address lies inside the program's
+image, and treats one outside it as a mismatch; it makes no syscall for this. It does not check
+the object's own storage, which compiler-rt does not check either. Its search of the base
+classes goes at most 512 levels deep and visits at most 2^20 base classes in all (a class that
+occurs more than once is counted each time); a search that reaches
+either limit is a mismatch and traps, even in a correct program, and the source comment says
+which programs that can be. Code compiled with `-fno-rtti` gets no vptr check.
 clang reads a config's options before the command line, so a command line that adds
 `-fsanitize-trap=all` must add `-fno-sanitize-trap=vptr` after it; clang refuses vptr in trap
 mode. A link with these flags and without the archive fails on

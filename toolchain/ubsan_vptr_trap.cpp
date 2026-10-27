@@ -32,15 +32,24 @@
 // bound is exact here and asks the kernel nothing.  That covers the vtable
 // prefix, each type_info node of the walk, the vptr of each node and the
 // type_info and name string it leads to, and each node's whole base-class
-// array.  The walk also visits at most kMaxNodes nodes, so a base-class graph
-// that loops inside the image ends too.  An address outside the image, or a
-// walk past the limit, is a mismatch, and traps, where reading it would fault
-// or the walk would not end.  Two reads are not tested: the object's own
-// storage, which compiler-rt reads untested too, so an object whose own page
-// is unmapped faults in either; and the check's static type_info, which the
-// compiler emits into the image.  And it compares type_info objects by address
+// array.  An address outside the image is a mismatch, and traps, where reading
+// it would fault.  Two reads are not tested: the object's own storage, which
+// compiler-rt reads untested too, so an object whose own page is unmapped
+// faults in either; and the check's static type_info, which the compiler emits
+// into the image.  And it compares type_info objects by address
 // or by the address of their names, which is exact in one statically linked
 // image, where each type has one type_info.
+//
+// The walk has two limits that compiler-rt's has not, and a search that reaches
+// either one is a mismatch, and traps.  It goes at most kMaxDepth (512) base
+// classes down from the dynamic type: a path deeper than that is not followed,
+// so a base that is found only below it is not found, and a base-class graph
+// that loops inside the image ends there.  512 frames of the walk fit well
+// inside a musl thread's default 128 KiB stack.  And it visits at most kMaxNodes
+// (1 << 20) nodes in all: when it has visited that many it stops, and the check
+// traps, even if a node it has not visited would match.  A correct program
+// whose search visits more nodes than that, which needs about a million base
+// subobjects of class type, therefore traps.
 //
 // It reads RTTI, so it is compiled with RTTI, and the code it checks must be
 // too: clang emits no vptr check in a translation unit built with -fno-rtti.
@@ -105,9 +114,12 @@ bool in_image_array(const void *p, unsigned long count, unsigned long elem) {
 static const char kSI[]  = "N10__cxxabiv120__si_class_type_infoE";
 static const char kVMI[] = "N10__cxxabiv121__vmi_class_type_infoE";
 static_assert(sizeof(kVMI) >= sizeof(kSI), "the name bound below uses kVMI");
-// The most nodes one walk visits.  A real class hierarchy visits a few dozen;
-// the limit is what ends a walk around a base-class graph that loops.
-static const unsigned kMaxNodes = 4096;
+// The walk's two limits; the file comment above says what each costs.  The
+// depth keeps the recursion inside a small thread stack, and ends a loop.  The
+// node count ends a walk over an acyclic graph whose paths multiply, which the
+// depth alone does not bound.
+static const unsigned kMaxDepth = 512;
+static const unsigned long kMaxNodes = 1ul << 20;
 // checkTypeInfoEquality collapses to pointer identity in a single statically
 // linked image (one copy of each type_info), which is our case.
 bool typeinfo_eq(const std::type_info *a, const std::type_info *b) {
@@ -115,8 +127,8 @@ bool typeinfo_eq(const std::type_info *a, const std::type_info *b) {
 }
 bool isDerivedFromAtOffset(const abi::__class_type_info *Derived,
                            const abi::__class_type_info *Base, long Offset,
-                           unsigned &Budget) {
-  if (Budget == 0)
+                           unsigned Depth, unsigned long &Budget) {
+  if (Depth > kMaxDepth || Budget == 0)
     return false;
   --Budget;
   // Every node of the walk is read, so every node must be in the image.
@@ -145,7 +157,7 @@ bool isDerivedFromAtOffset(const abi::__class_type_info *Derived,
   if (__builtin_strcmp(k, kSI) == 0)
     return isDerivedFromAtOffset(
         static_cast<const abi::__si_class_type_info *>(Derived)->__base_type,
-        Base, Offset, Budget);
+        Base, Offset, Depth + 1, Budget);
   if (__builtin_strcmp(k, kVMI) != 0)
     return false;  // __class_type_info leaf (no bases) or an unknown node
   const abi::__vmi_class_type_info *VTI =
@@ -162,7 +174,7 @@ bool isDerivedFromAtOffset(const abi::__class_type_info *Derived,
         abi::__base_class_type_info::__virtual_mask)
       return true;  // conservative: a virtual base cannot be ruled out here
     if (isDerivedFromAtOffset(VTI->__base_info[base].__base_type, Base,
-                              Offset - OffsetHere, Budget))
+                              Offset - OffsetHere, Depth + 1, Budget))
       return true;
   }
   return false;
@@ -185,8 +197,9 @@ bool checkDynamicType(void *Object, void *Type, HashValue Hash) {
   abi::__class_type_info *Derived =
       static_cast<abi::__class_type_info *>(Prefix->TypeInfo);
   abi::__class_type_info *Base = reinterpret_cast<abi::__class_type_info *>(Type);
-  unsigned Budget = kMaxNodes;
-  if (!isDerivedFromAtOffset(Derived, Base, -Prefix->Offset, Budget)) return false;
+  unsigned long Budget = kMaxNodes;
+  if (!isDerivedFromAtOffset(Derived, Base, -Prefix->Offset, 0, Budget))
+    return false;
   __ubsan_vptr_type_cache[Hash % VptrTypeCacheSize] = Hash;  // compiler-rt cache protocol
   return true;
 }
