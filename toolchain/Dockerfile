@@ -1225,14 +1225,17 @@ RUN set -eu; \
 # and runs; a sealed ASan program that reads past size() and within capacity()
 # reports (exit 134); and one that grows, shrinks and copies a string correctly
 # does not.  The two ASan programs run only when the interceptor check above
-# could run its binary.
+# could run its binary.  The sealed runtime does not lower RLIMIT_CORE, as
+# disable_coredump does in the other configs, so the program that reports turns
+# off its own core dump: a core of its address space, shadow included, takes
+# minutes to write and can fill the build host's disk.
 RUN set -eu; \
     grep -q "^#define _LIBCPP_INSTRUMENTED_WITH_ASAN 1$" "$ASAN_LIBCXX/include/$TRIPLE/c++/v1/__config_site"; \
     grep -q "^#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0$" "$SYSROOT/usr/include/$TRIPLE/c++/v1/__config_site"; \
     printf '#include <cstdio>\n#include <string>\nint main(){std::string s("plain");std::printf("%%s\\n",s.c_str());return 0;}\n' > /tmp/plain.cpp; \
     clang++ --config=/opt/asan-static/musl.cfg -stdlib=libc++ /tmp/plain.cpp -o /tmp/plain-cxx; \
     [ "$(/tmp/plain-cxx)" = plain ]; \
-    printf '#include <cstdio>\n#include <string>\nint main(){std::string s;s.reserve(64);s.resize(4,(char)97);volatile char c=s.data()[20];std::printf("%%d\\n",(int)c);return 0;}\n' > /tmp/string-over.cpp; \
+    printf '#include <cstdio>\n#include <string>\n#include <sys/prctl.h>\n#include <sys/resource.h>\nint main(){struct rlimit r={0,0};setrlimit(RLIMIT_CORE,&r);prctl(PR_SET_DUMPABLE,0);std::string s;s.reserve(64);s.resize(4,(char)97);volatile char c=s.data()[20];std::printf("%%d\\n",(int)c);return 0;}\n' > /tmp/string-over.cpp; \
     printf '#include <cstdio>\n#include <string>\nint main(){std::string s("hello");for(int i=0;i<200;i++)s+=(char)(97+i%%26);s.resize(10);s.shrink_to_fit();std::string t=s+s;std::printf("%%zu\\n",t.size());return 0;}\n' > /tmp/string-ok.cpp; \
     clang++ --config=/opt/asan-static/asan-musl-sealed.cfg -stdlib=libc++ -O1 /tmp/string-over.cpp -o /tmp/string-over; \
     clang++ --config=/opt/asan-static/asan-musl-sealed.cfg -stdlib=libc++ -O1 /tmp/string-ok.cpp -o /tmp/string-ok; \
