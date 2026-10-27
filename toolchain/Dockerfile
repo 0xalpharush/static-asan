@@ -44,11 +44,11 @@
 # none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
 # section of README.md.
 #
-# The three steps at the end run binaries for the target.  On a native build that
+# Five of the steps at the end run binaries for the target.  On a native build that
 # is nothing to arrange; on a cross build the machine has to be able to execute
 # them, which on Linux means binfmt_misc with qemu-user registered -- `docker run
 # --privileged tonistiigi/binfmt --install <arch>` once per boot, or
-# docker/setup-qemu-action in CI.  Only these three steps need it.  Nothing the
+# docker/setup-qemu-action in CI.  Only these five steps need it.  Nothing the
 # image is for does.
 #
 # Sources are taken from the mounted checkouts at their pinned base commits with
@@ -63,12 +63,25 @@
 #                                      + kernel uapi headers + LLVM libunwind.a
 #   /opt/musl-sysroot/usr/lib/asan-libcxx  a second libc++ / libc++abi, built
 #                                      with ASan, for the static ASan configs
+#   /opt/musl-sysroot/usr/lib/hardened-libcxx
+#                                      a third libc++ / libc++abi, built with
+#                                      the extensive hardening mode, for
+#                                      musl-hardened.cfg
+#   /opt/ubsan-vptr-trap/libclang_rt.ubsan_vptr_trap.a
+#                                      a trap-only -fsanitize=vptr handler, for
+#                                      ubsan-vptr-musl.cfg
 #   /opt/asan-rt/lib/clang/20          stock compiler-rt: dlsym interception,
 #                                      what a dynamic link uses
 #   /opt/asan-static-rt/lib/clang/20   compiler-rt with COMPILER_RT_STATIC_INTERCEPTION:
 #                                      the static ASan runtime is attached by the
 #                                      linker, plus libclang_rt.asan.a.wrap
 #   /opt/asan-static/musl.cfg          clang config: plain static musl
+#   /opt/asan-static/musl-hardened.cfg clang config: musl.cfg, with C++ against
+#                                      the hardened libc++
+#   /opt/asan-static/ubsan-vptr-musl.cfg
+#                                      clang config: musl.cfg with
+#                                      -fsanitize=vptr checks that trap, through
+#                                      the handler above and no UBSan runtime
 #   /opt/asan-static/asan-musl.cfg     clang config: static musl + ASan
 #   /opt/asan-static/asan-musl-dynamic.cfg
 #                                      clang config: dynamic ASan, stock runtime
@@ -124,6 +137,8 @@ ARG SYSROOT=/opt/musl-sysroot
 ARG RESOURCE_DIR=/opt/asan-rt/lib/clang/20
 ARG STATIC_RESOURCE_DIR=/opt/asan-static-rt/lib/clang/20
 ARG ASAN_LIBCXX=$SYSROOT/usr/lib/asan-libcxx
+ARG HARDENED_LIBCXX=$SYSROOT/usr/lib/hardened-libcxx
+ARG VPTR_TRAP=/opt/ubsan-vptr-trap
 
 # Extra target flags threaded through every component that ends up inside a link
 # this image makes: musl, libunwind, both compiler-rt builds, and the six config
@@ -812,9 +827,107 @@ RUN cmake -S /llvm-project/runtimes -B /build/asan-libcxx -G Ninja \
  && rm -rf /build/asan-libcxx
 
 # ---------------------------------------------------------------------------
+# 4c. LLVM libc++ / libc++abi a third time, hardened -> $HARDENED_LIBCXX
+#
+# libc++'s hardening mode turns the library's preconditions into checks: an
+# index past the end of a std::span, std::string_view, std::array or
+# std::vector, front() or back() of an empty container, operator* of an empty
+# std::optional, an iterator range whose ends are swapped, a null pointer with
+# a nonzero length.  In every mode but debug a failed check runs the default
+# assertion handler, which is __builtin_verbose_trap: the program dies on the
+# trap instruction and prints nothing, as a -fsanitize-trap check does.
+#
+# Defining _LIBCPP_HARDENING_MODE when the program is compiled reaches only the
+# code that the program's own translation units compile: the inline functions
+# and templates of the headers.  The members of std::string and of the streams
+# that libc++ instantiates in libc++.a are compiled once, when the library is,
+# and the program calls that copy.  So the library is built here with
+# LIBCXX_HARDENING_MODE=extensive.  Its __config_site then makes extensive the
+# default for every program compiled against its headers, and its archive has
+# the checks too.  Measured, riscv64: section 2b's libc++.a has 6 trap
+# instructions and this one has 319.  A program that calls
+# std::string::find(nullptr, pos, n) with pos past the end and n nonzero, or
+# std::string::rfind(nullptr, 0, n), traps with this copy, and does not with
+# section 2b's copy and -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE.
+#
+# As with 4b, section 2b's copy stays as it is, and this one has its own prefix
+# and its own __config_site.  Only musl-hardened.cfg (section 5) uses it.  The
+# CMake flags are section 2b's, with two differences: the hardening mode and
+# the install prefix.  As in 4b, only install-cxx and install-cxxabi run.
+# ---------------------------------------------------------------------------
+RUN cmake -S /llvm-project/runtimes -B /build/hardened-libcxx -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_RUNTIMES="libunwind;libcxxabi;libcxx" \
+      -DLIBCXX_HARDENING_MODE=extensive \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang \
+      -DCMAKE_C_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_CXX_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_ASM_COMPILER_TARGET="$TRIPLE" \
+      -DCMAKE_SYSROOT="$SYSROOT" \
+      -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections $TARGET_CFLAGS" \
+      -DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections $TARGET_CFLAGS" \
+      -DCMAKE_ASM_FLAGS="$TARGET_CFLAGS" \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+      -DLIBUNWIND_ENABLE_SHARED=OFF \
+      -DLIBUNWIND_ENABLE_STATIC=ON \
+      -DLIBUNWIND_USE_COMPILER_RT=ON \
+      -DLIBUNWIND_INCLUDE_TESTS=OFF \
+      -DLIBCXX_ENABLE_SHARED=OFF \
+      -DLIBCXX_ENABLE_STATIC=ON \
+      -DLIBCXXABI_ENABLE_SHARED=OFF \
+      -DLIBCXXABI_ENABLE_STATIC=ON \
+      -DLIBCXX_HAS_MUSL_LIBC=ON \
+      -DLIBCXX_USE_COMPILER_RT=ON \
+      -DLIBCXXABI_USE_COMPILER_RT=ON \
+      -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+      -DLIBCXX_CXX_ABI=libcxxabi \
+      -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
+      -DLIBCXX_ENABLE_THREADS=ON \
+      -DLIBCXXABI_ENABLE_THREADS=OFF \
+      -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+      -DLIBCXX_INCLUDE_TESTS=OFF \
+      -DLIBCXXABI_INCLUDE_TESTS=OFF \
+      -DCMAKE_INSTALL_PREFIX="$HARDENED_LIBCXX" \
+      -DLIBCXX_INSTALL_LIBRARY_DIR="$HARDENED_LIBCXX/lib" \
+      -DLIBCXXABI_INSTALL_LIBRARY_DIR="$HARDENED_LIBCXX/lib" \
+      -DLIBCXX_INSTALL_INCLUDE_DIR="$HARDENED_LIBCXX/include/c++/v1" \
+      -DLIBCXX_INSTALL_INCLUDE_TARGET_DIR="$HARDENED_LIBCXX/include/$TRIPLE/c++/v1" \
+ && ninja -C /build/hardened-libcxx -j"$(nproc)" cxx cxxabi \
+ && ninja -C /build/hardened-libcxx install-cxx install-cxxabi \
+ && rm -rf /build/hardened-libcxx
+
+# ---------------------------------------------------------------------------
+# 4d. A trap-only -fsanitize=vptr handler -> $VPTR_TRAP
+#
+# A vptr check (a downcast, member call or member access whose object's dynamic
+# type is not the static type) cannot be a trap: -fsanitize-trap=vptr is an
+# error, because the decision needs the object's RTTI, which the inline check
+# cannot read.  So -fsanitize-trap=all leaves vptr out, and the check otherwise
+# calls __ubsan_handle_dynamic_type_cache_miss_abort in the UBSan runtime.
+# toolchain/ubsan_vptr_trap.cpp defines that handler and the cache it fills,
+# and nothing else: the runtime's decision, then __builtin_trap() on a
+# mismatch.  A link that passes -fno-sanitize-link-runtime and this archive gets
+# vptr checks with the same outcome as the other trap-mode checks and no UBSan
+# runtime (ubsan-vptr-musl.cfg, section 5).
+#
+# It is compiled with the target's flags and no sanitizer, against section 2b's
+# libc++ headers.  It reads the type_info layout of libc++abi, which every
+# libc++ copy in this image shares.  The archive's name matches
+# libclang_rt.*.a, as the other sanitizer runtimes' names do.
+# ---------------------------------------------------------------------------
+COPY ubsan_vptr_trap.cpp /src/ubsan_vptr_trap.cpp
+RUN set -eu; \
+    mkdir -p "$VPTR_TRAP"; \
+    clang++ --target="$TRIPLE" --sysroot="$SYSROOT" $TARGET_CFLAGS -stdlib=libc++ \
+      -O2 -ffunction-sections -fdata-sections -fno-exceptions \
+      -c /src/ubsan_vptr_trap.cpp -o /tmp/ubsan_vptr_trap.o; \
+    llvm-ar rcsD "$VPTR_TRAP/libclang_rt.ubsan_vptr_trap.a" /tmp/ubsan_vptr_trap.o; \
+    rm /tmp/ubsan_vptr_trap.o
+
+# ---------------------------------------------------------------------------
 # 5. clang config files
 #
-# Seven of them, each explicitly named on the command line; none is a default
+# Nine of them, each explicitly named on the command line; none is a default
 # config.  A default config is selected by target triple and loads on every
 # invocation, so the wrap response file in it would break every link that does
 # not pull in the ASan runtime (undefined symbol: __wrap_memset).  Each of these
@@ -833,6 +946,19 @@ RUN cmake -S /llvm-project/runtimes -B /build/asan-libcxx -G Ninja \
 # what nothing references; the wrap list is the same file and attaches the
 # same interceptors to every call the program or the libc makes.  The README's
 # "Binary size" section has the numbers and what remains.
+#
+# musl-hardened.cfg is musl.cfg with section 4c's libc++ headers and library in
+# front of the default ones, as the ASan configs put section 4b's.
+# ubsan-vptr-musl.cfg is musl.cfg plus the vptr check and section 4d's handler:
+# -fno-sanitize-trap=vptr, because vptr cannot trap; -fno-sanitize-recover=vptr,
+# so the check calls the _abort handler; -fno-sanitize-link-runtime, so the
+# driver links no UBSan runtime; and the archive, as a -Wl, argument, so a
+# compile with -c does not see a linker input.  clang reads a config's options
+# before the command line, so a command line that adds -fsanitize-trap=all
+# must add -fno-sanitize-trap=vptr after it: -fsanitize-trap=all would
+# otherwise name vptr again, and clang refuses vptr in trap mode.  Neither
+# config can be combined with the ASan ones: each picks its own libc++, and
+# -fno-sanitize-link-runtime would drop the ASan runtime.
 #
 # asan-musl-sealed.cfg and asan-musl-silent.cfg are the last two and are the odd
 # ones: each is asan-musl.cfg plus one --defsym, and neither has a runtime of its
@@ -893,7 +1019,7 @@ RUN cmake -S /llvm-project/runtimes -B /build/asan-libcxx -G Ninja \
 # the default) and every other linker rejects outright, to turn "used the wrong
 # linker" into a link error instead of a runtime crash.
 #
-# Six of the seven therefore name lld, and asan-musl-dynamic.cfg is not an
+# Eight of the nine therefore name lld, and asan-musl-dynamic.cfg is not an
 # exception being made: it needs a linker that can target
 # this architecture and clang's default is not one on a cross-built image, and
 # between the two that can -- lld, and the GNU ld asan-musl-bfd.cfg uses -- only
@@ -921,6 +1047,7 @@ RUN set -eu; \
     wrap=$(clang --target="$TRIPLE" -resource-dir="$STATIC_RESOURCE_DIR" \
              -print-runtime-dir)/libclang_rt.asan.a.wrap; \
     [ -f "$wrap" ] || { echo "no wrap list at $wrap"; exit 1; }; \
+    [ -f "$VPTR_TRAP/libclang_rt.ubsan_vptr_trap.a" ] || { echo "no vptr handler in $VPTR_TRAP"; exit 1; }; \
     set -- /usr/"$APK_ARCH"-alpine-linux-*/bin/ld.bfd; \
     [ $# -eq 1 ] && [ -x "$1" ] || { echo "expected exactly one target ld.bfd, found: $*"; exit 1; }; \
     bfd=${1%/ld.bfd}; \
@@ -937,6 +1064,42 @@ RUN set -eu; \
       "-static" \
       "-Wl,--gc-sections" \
       > /opt/asan-static/musl.cfg \
+ && printf '%s\n' \
+      "# Static musl, no sanitizer, C++ against the hardened libc++ (section 4c)." \
+      "# clang++ --config=/opt/asan-static/musl-hardened.cfg -stdlib=libc++ prog.cpp -o prog" \
+      "--target=$TRIPLE" \
+      "--sysroot=$SYSROOT" \
+      "$TARGET_CFLAGS" \
+      "-resource-dir=$RESOURCE_DIR" \
+      "-stdlib++-isystem$HARDENED_LIBCXX/include/$TRIPLE/c++/v1" \
+      "-stdlib++-isystem$HARDENED_LIBCXX/include/c++/v1" \
+      "-L$HARDENED_LIBCXX/lib" \
+      "--rtlib=compiler-rt" \
+      "--unwindlib=libunwind" \
+      "-fuse-ld=lld" \
+      "-static" \
+      "-Wl,--gc-sections" \
+      > /opt/asan-static/musl-hardened.cfg \
+ && printf '%s\n' \
+      "# Static musl with -fsanitize=vptr checks that trap, through the handler" \
+      "# in $VPTR_TRAP and no UBSan runtime (section 4d)." \
+      "# clang++ --config=/opt/asan-static/ubsan-vptr-musl.cfg -stdlib=libc++ prog.cpp -o prog" \
+      "# With -fsanitize-trap=all on the command line, add -fno-sanitize-trap=vptr after it." \
+      "--target=$TRIPLE" \
+      "--sysroot=$SYSROOT" \
+      "$TARGET_CFLAGS" \
+      "-resource-dir=$RESOURCE_DIR" \
+      "--rtlib=compiler-rt" \
+      "--unwindlib=libunwind" \
+      "-fuse-ld=lld" \
+      "-static" \
+      "-Wl,--gc-sections" \
+      "-fsanitize=vptr" \
+      "-fno-sanitize-trap=vptr" \
+      "-fno-sanitize-recover=vptr" \
+      "-fno-sanitize-link-runtime" \
+      "-Wl,$VPTR_TRAP/libclang_rt.ubsan_vptr_trap.a" \
+      > /opt/asan-static/ubsan-vptr-musl.cfg \
  && printf '%s\n' \
       "# Static musl with AddressSanitizer." \
       "# clang --config=/opt/asan-static/asan-musl.cfg prog.c -o prog" \
@@ -1247,6 +1410,116 @@ RUN set -eu; \
       [ "$(/tmp/string-ok)" = 20 ]; \
       echo "std::string container-overflow is reported; a correct program does not report"; \
     fi
+
+# The last two steps check sections 4c and 4d, with programs that are static,
+# not position-independent and not ASan, like /tmp/hello in the first step, so
+# they run wherever that one did, natively or under qemu-user, and they ask
+# nothing more of the machine.  A check that fails dies on the target's trap
+# instruction, so the status a failed check must give is measured on this
+# target first, from a program that calls __builtin_trap(): SIGILL (132) on
+# x86_64, riscv64 and 32-bit Arm, and SIGTRAP (133) on aarch64, whose trap is
+# brk.  Each program that traps turns off its own core dump first, as the
+# std::string step's does.  `expect` runs one program under busybox timeout
+# -s KILL (a program stopped there gives 137, which no case expects) and
+# requires its exit status and its whole standard output; standard error is
+# not read, because qemu-user writes its own line there when a program dies
+# by a signal.  Each program reads no input and depends on no address the
+# kernel chooses, so one run decides.
+#
+# The hardened libc++ (4c).  Its __config_site makes extensive the default and
+# section 2b's keeps none.  With musl-hardened.cfg, an index past the end of a
+# std::span (a check inline in the program) and std::string::find with a null
+# pointer, a start past the end and a nonzero length (a check in libc++.a)
+# trap after "before", and a correct program that uses strings, a sort, a span,
+# a string_view, an optional, a map and a stringstream does not trap.  The
+# same two bad programs built with musl.cfg reach "after": the default copy
+# checks neither.
+RUN set -eu; \
+    ulimit -c 0; \
+    grep -q "^#define _LIBCPP_HARDENING_MODE_DEFAULT 16$" "$HARDENED_LIBCXX/include/$TRIPLE/c++/v1/__config_site"; \
+    grep -q "^#define _LIBCPP_HARDENING_MODE_DEFAULT 2$" "$SYSROOT/usr/include/$TRIPLE/c++/v1/__config_site"; \
+    nocore='#include <sys/prctl.h>\n#include <sys/resource.h>\nstatic void nocore(void){struct rlimit r={0,0};setrlimit(RLIMIT_CORE,&r);prctl(PR_SET_DUMPABLE,0);}\n'; \
+    printf "$nocore"'#include <stdio.h>\nint main(void){nocore();puts("before");fflush(stdout);__builtin_trap();}\n' > /tmp/trap.c; \
+    printf "$nocore"'#include <cstdio>\n#include <span>\nstatic volatile int idx=5;static volatile int sink;\nint main(){nocore();int a[4]={1,2,3,4};std::span<int> s(a,4);std::puts("before");std::fflush(stdout);sink=s[idx];std::puts("after");return 0;}\n' > /tmp/hard-span.cpp; \
+    printf "$nocore"'#include <cstdio>\n#include <string>\nstatic const char *volatile p;static volatile unsigned long pos=100,n=5;\nint main(){nocore();std::string s("abc");std::puts("before");std::fflush(stdout);std::printf("after %%ld\\n",(long)s.find(p,pos,n));return 0;}\n' > /tmp/hard-find.cpp; \
+    printf '#include <algorithm>\n#include <cstdio>\n#include <map>\n#include <optional>\n#include <span>\n#include <sstream>\n#include <string>\n#include <string_view>\n#include <vector>\nint main(){std::vector<int> v;for(int i=0;i<1000;i++)v.push_back((i*7919)%%1000);std::sort(v.begin(),v.end());std::span<int> s(v);long t=s[999]+s.subspan(10,5)[4];std::string str("hello");for(int i=0;i<200;i++)str+=(char)(97+i%%26);str.replace(2,3,"xyz");str.insert(0,"a");t+=str.compare(0,3,"aab",3)+(long)str.find("xyz")+(long)str.size();std::string_view sv(str);t+=(long)sv.substr(3,4).size()+sv.back();std::optional<int> o=3;t+=*o;std::map<std::string,int> m;m["b"]=2;t+=m.at("b");std::ostringstream os;os<<t;std::istringstream is(os.str());long u=0;is>>u;std::printf("hardened ok %%ld %%ld\\n",t,u);return 0;}\n' > /tmp/hard-ok.cpp; \
+    clang --config=/opt/asan-static/musl.cfg /tmp/trap.c -o /tmp/trap; \
+    h="clang++ --config=/opt/asan-static/musl-hardened.cfg -stdlib=libc++ -std=c++20 -Os"; \
+    d="clang++ --config=/opt/asan-static/musl.cfg -stdlib=libc++ -std=c++20 -Os"; \
+    $h /tmp/hard-span.cpp -o /tmp/hard-span; $h /tmp/hard-find.cpp -o /tmp/hard-find; $h /tmp/hard-ok.cpp -o /tmp/hard-ok; \
+    $d /tmp/hard-span.cpp -o /tmp/hard-span-default; $d /tmp/hard-find.cpp -o /tmp/hard-find-default; \
+    expect() { \
+      want_st=$1; want_out=$2; shift 2; st=0; \
+      timeout -s KILL 60 "$@" >/tmp/expect.out 2>/tmp/expect.err || st=$?; \
+      out=$(cat /tmp/expect.out); \
+      if [ "$st" != "$want_st" ] || [ "$out" != "$want_out" ]; then \
+        printf '%s: exit %s and stdout [%s], not exit %s and stdout [%s]; stderr:\n' "$*" "$st" "$out" "$want_st" "$want_out" >&2; \
+        cat /tmp/expect.err >&2; exit 1; \
+      fi; \
+      echo "$*: exit $st, as expected"; \
+    }; \
+    st=0; /tmp/trap >/dev/null 2>&1 || st=$?; \
+    case $st in 132|133) ;; *) echo "__builtin_trap() exited $st, not by SIGILL or SIGTRAP" >&2; exit 1 ;; esac; \
+    echo "a trap exits $st on this target"; \
+    expect "$st" before /tmp/hard-span; \
+    expect "$st" before /tmp/hard-find; \
+    expect 0 "hardened ok 1352 1352" /tmp/hard-ok; \
+    expect 0 "$(printf 'before\nafter')" /tmp/hard-span-default; \
+    expect 0 "$(printf 'before\nafter -1')" /tmp/hard-find-default; \
+    echo "the hardened libc++ traps on a broken precondition, in the headers and in libc++.a; the default copy does not"
+
+# The vptr handler (4d).  The archive defines the two handlers and the cache
+# and nothing else, and has no global constructor.  With ubsan-vptr-musl.cfg, a
+# static_cast to a class that is not the object's dynamic type, then a member
+# call through it, traps after "before"; so does the same program with the
+# release's UBSan flags added (-fsanitize-trap=all, then -fno-sanitize-trap=vptr
+# after it, as section 5 says).  A correct program does not trap: casts and
+# calls through single, multiple and virtual inheritance, 300 times each, so
+# that the handler both misses and fills the 128-slot cache, a dynamic_cast,
+# and an exception thrown and caught.  Two links must not work: the same
+# vptr flags without the archive fail on the handler's name, --gc-sections
+# included, as musl.cfg passes it; and the bad program built with musl.cfg has
+# no check and reaches "after".
+RUN set -eu; \
+    ulimit -c 0; \
+    a="$VPTR_TRAP/libclang_rt.ubsan_vptr_trap.a"; \
+    syms=$(llvm-nm -g --defined-only "$a" | awk 'NF==3{print $2" "$3}' | LC_ALL=C sort | tr '\n' ';'); \
+    [ "$syms" = "B __ubsan_vptr_type_cache;T __ubsan_handle_dynamic_type_cache_miss;T __ubsan_handle_dynamic_type_cache_miss_abort;" ] \
+      || { echo "the vptr handler archive defines: $syms" >&2; exit 1; }; \
+    ! llvm-readelf -SW "$a" | grep -qE '\.(init_array|ctors)' || { echo "the vptr handler has a global constructor" >&2; exit 1; }; \
+    nocore='#include <sys/prctl.h>\n#include <sys/resource.h>\nstatic void nocore(void){struct rlimit r={0,0};setrlimit(RLIMIT_CORE,&r);prctl(PR_SET_DUMPABLE,0);}\n'; \
+    printf "$nocore"'#include <cstdio>\nstruct B{virtual ~B(){}virtual int v(){return 1;}};\nstruct D:B{int d=4;int f(){return d;}};\nstruct E:B{int e=5;};\nstatic B *volatile p;\nint main(){nocore();p=new E;std::puts("before");std::fflush(stdout);D *d=static_cast<D *>(p);std::printf("after %%d\\n",d->f());return 0;}\n' > /tmp/vptr-bad.cpp; \
+    printf '#include <cstdio>\n#include <memory>\n#include <stdexcept>\n#include <string>\n#include <vector>\nstruct B{virtual ~B(){}virtual int v(){return 1;}};\nstruct D:B{int d=4;int f(){return d;}int v() override{return 2;}};\nstruct M1{virtual ~M1(){}long m1=7;};\nstruct M2{virtual ~M2(){}long m2=8;long g(){return m2;}};\nstruct MI:M1,M2{long h(){return m1+m2;}};\nstruct VB{virtual ~VB(){}int vb=9;};\nstruct V1:virtual VB{int v1=1;};\nstruct V2:virtual VB{int v2=2;};\nstruct VD:V1,V2{int s(){return vb+v1+v2;}};\nstatic B *volatile pb;static M2 *volatile pm;static VB *volatile pv;static V1 *volatile p1;\nint main(){long t=0;for(int i=0;i<300;i++){pb=new D;t+=static_cast<D *>(pb)->f()+pb->v();delete pb;pm=static_cast<M2 *>(new MI);t+=static_cast<MI *>(pm)->h()+pm->g();delete static_cast<MI *>(pm);pv=static_cast<VB *>(new VD);t+=dynamic_cast<VD *>(pv)->s();delete pv;p1=new VD;t+=static_cast<VD *>(p1)->s();delete p1;}\ntry{throw std::runtime_error("x");}catch(const std::exception &e){t+=(long)std::string(e.what()).size();}\nstd::vector<std::unique_ptr<B>> v;for(int i=0;i<4;i++)v.emplace_back(new D);for(auto &q:v)t+=q->v();std::printf("vptr ok %%ld\\n",t);return 0;}\n' > /tmp/vptr-ok.cpp; \
+    printf "$nocore"'#include <stdio.h>\nint main(void){nocore();puts("before");fflush(stdout);__builtin_trap();}\n' > /tmp/vtrap.c; \
+    clang --config=/opt/asan-static/musl.cfg /tmp/vtrap.c -o /tmp/vtrap; \
+    v="clang++ --config=/opt/asan-static/ubsan-vptr-musl.cfg -stdlib=libc++ -Os"; \
+    $v /tmp/vptr-bad.cpp -o /tmp/vptr-bad; \
+    $v -fsanitize=undefined -fno-sanitize-recover=all -fsanitize-trap=all -fno-sanitize=function -fno-sanitize-trap=vptr /tmp/vptr-bad.cpp -o /tmp/vptr-bad-ubsan; \
+    $v /tmp/vptr-ok.cpp -o /tmp/vptr-ok; \
+    clang++ --config=/opt/asan-static/musl.cfg -stdlib=libc++ -Os /tmp/vptr-bad.cpp -o /tmp/vptr-bad-plain; \
+    if clang++ --config=/opt/asan-static/musl.cfg -stdlib=libc++ -Os -fsanitize=vptr -fno-sanitize-trap=vptr \
+         -fno-sanitize-recover=vptr -fno-sanitize-link-runtime /tmp/vptr-bad.cpp -o /tmp/vptr-nohandler 2>/tmp/vptr-nohandler.log; then \
+      echo "a vptr link without the handler succeeded" >&2; exit 1; \
+    fi; \
+    grep -q "undefined symbol: __ubsan_handle_dynamic_type_cache_miss_abort$" /tmp/vptr-nohandler.log \
+      || { cat /tmp/vptr-nohandler.log >&2; exit 1; }; \
+    expect() { \
+      want_st=$1; want_out=$2; shift 2; st=0; \
+      timeout -s KILL 60 "$@" >/tmp/expect.out 2>/tmp/expect.err || st=$?; \
+      out=$(cat /tmp/expect.out); \
+      if [ "$st" != "$want_st" ] || [ "$out" != "$want_out" ]; then \
+        printf '%s: exit %s and stdout [%s], not exit %s and stdout [%s]; stderr:\n' "$*" "$st" "$out" "$want_st" "$want_out" >&2; \
+        cat /tmp/expect.err >&2; exit 1; \
+      fi; \
+      echo "$*: exit $st, as expected"; \
+    }; \
+    st=0; /tmp/vtrap >/dev/null 2>&1 || st=$?; \
+    case $st in 132|133) ;; *) echo "__builtin_trap() exited $st, not by SIGILL or SIGTRAP" >&2; exit 1 ;; esac; \
+    expect "$st" before /tmp/vptr-bad; \
+    expect "$st" before /tmp/vptr-bad-ubsan; \
+    expect 0 "vptr ok 15909" /tmp/vptr-ok; \
+    expect 0 "$(printf 'before\nafter 5')" /tmp/vptr-bad-plain; \
+    echo "a bad downcast traps through the vptr handler; a correct program does not; a link without the handler fails"
 
 ENV MUSL_SYSROOT=$SYSROOT \
     ASAN_RESOURCE_DIR=$RESOURCE_DIR
