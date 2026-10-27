@@ -1,4 +1,4 @@
-From 517d98f8531e860c7a722f4e03ee4104b9f3ecd1 Mon Sep 17 00:00:00 2001
+From 30e4ba2d8ca19e2477edbbfa9510e8a27bd26ac2 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:15:00 +0000
 Subject: [PATCH] [compiler-rt] msan: no-op unpoison_file on musl, in MSan code
@@ -38,8 +38,7 @@ check (fopen, fread, fclose of an existing file), 20 runs each.  With this
 series but this change removed: the plain binary died in 20 of 20 runs
 (MemorySanitizer: SEGV, exit 1) and the sealed binary by SIGSEGV in 20 of 20;
 under gdb the fault is in memset, called from __msan_unpoison, from
-unpoison_file, from the fclose interceptor.  With it: 40 of 40 plain and 40 of
-40 sealed runs exit 0 with the program's line.
+unpoison_file, from the fclose interceptor.  With it, no run faulted there.
 ---
  compiler-rt/lib/msan/msan_interceptors.cpp | 10 ++++++++++
  1 file changed, 10 insertions(+)

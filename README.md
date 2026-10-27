@@ -340,7 +340,12 @@ Measured on an x86_64 kernel that places `[vvar]` and `[vdso]` in the mmap area:
 - with an unlimited stack limit (`ulimit -s unlimited`), every run spins. The kernel
   then uses the legacy bottom-up layout, which starts inside MSan's shadow.
 
-Use a timeout when you run sealed MSan binaries, as for sealed ASan.
+Use a timeout when you run sealed MSan binaries, as for sealed ASan. A sealed MSan
+detection aborts with `SIGABRT`, and the runtime does not lower `RLIMIT_CORE`, so the
+process dumps core unless you turn core dumps off (`ulimit -c 0`, or
+`setrlimit(RLIMIT_CORE)` and `prctl(PR_SET_DUMPABLE, 0)` in the program). Where
+`core_pattern` pipes to a handler, writing that core can take longer than the
+timeout.
 
 ## CI
 

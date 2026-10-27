@@ -1218,6 +1218,12 @@ RUN set -eu; \
 #            0027).  The report proves interception and
 #            instrumentation are live.
 #
+# Both programs first turn core dumps off (RLIMIT_CORE 0 and PR_SET_DUMPABLE
+# 0).  A sealed detection dies by SIGABRT and the runtime leaves RLIMIT_CORE
+# alone, so without that the kernel dumps a core; where core_pattern pipes to a
+# handler, as on the CI runners, writing it outlasts the timeout below and a
+# run that reported is killed (137) instead of ending by 134.
+#
 # Each binary is run MSAN_RUNS times, under `timeout -s KILL`, and every run is
 # classified by one function, msan_check.  The image's timeout is busybox's: it
 # kills the program itself, so the shell sees 128+signal -- 137 for KILL -- and
@@ -1257,9 +1263,11 @@ RUN set -eu; \
 # stack inside MSan's origin range, and both the plain and the sealed runs fail.
 # So the step first runs a static probe and reads /proc/<pid>/exe from outside
 # it: natively that is the probe itself, under binfmt_misc it is the emulator.
-# Under emulation nothing is run and nothing is reported as passing, and the
-# miss goes through VERIFY_RUNTIME like the others: "require" fails the build
-# saying so, "defer" appends to RUNTIME-UNVERIFIED that MSan was not verified.
+# If that link cannot be read at all, the step cannot tell which, and says so
+# rather than guess.  In either case nothing is run and nothing is reported as
+# passing, and the miss goes through VERIFY_RUNTIME like the others, by one
+# helper, deferral(): "require" fails the build saying so, "defer" appends to
+# RUNTIME-UNVERIFIED that MSan was not verified.
 # The targets without an msan runtime (riscv64, armv7) skip this step before
 # the probe.  CI builds aarch64 on a native arm64 runner, so CI runs these
 # binaries for real.
@@ -1274,7 +1282,10 @@ RUN set -eu; \
       '#include <stdio.h>' \
       '#include <stdlib.h>' \
       '#include <string.h>' \
+      '#include <sys/prctl.h>' \
+      '#include <sys/resource.h>' \
       'int main(void){' \
+      '  struct rlimit nocore = {0, 0}; setrlimit(RLIMIT_CORE, &nocore); prctl(PR_SET_DUMPABLE, 0);  /* no core */' \
       '  char *d = malloc(64); memset(d, 0x41, 64);' \
       '  unsigned long s = 0; for (int i = 0; i < 64; i++) s += (unsigned char)d[i];' \
       '  FILE *f = fopen("/tmp/msan_clean.c", "rb");' \
@@ -1285,7 +1296,10 @@ RUN set -eu; \
     printf '%s\n' \
       '#include <stdio.h>' \
       '#include <stdlib.h>' \
+      '#include <sys/prctl.h>' \
+      '#include <sys/resource.h>' \
       'int main(void){' \
+      '  struct rlimit nocore = {0, 0}; setrlimit(RLIMIT_CORE, &nocore); prctl(PR_SET_DUMPABLE, 0);  /* no core */' \
       '  volatile int *p = (volatile int *)malloc(sizeof(int));  /* uninitialized */' \
       '  int r = *p ? 1 : 2;  /* branch on an uninitialized value: MSan must report */' \
       '  printf("%d\n", r); free((void *)p); return 0;' \
@@ -1304,31 +1318,43 @@ RUN set -eu; \
     grep -q "__msan_wrap_list_present" /tmp/msan_detached.log \
       || { echo "the msan link without the wrap list failed for another reason:" >&2; cat /tmp/msan_detached.log >&2; exit 1; }; \
     echo "an msan link without the wrap list fails, with --gc-sections"; \
-    unverified() { \
-      printf '%s\n' "" "MemorySanitizer: $1 was not verified when this image was built." "$2" \
+    deferral() { \
+      what=$1 why=$2; shift 2; \
+      printf '%s\n' "" "$@" "" >&2; \
+      if [ "$VERIFY_RUNTIME" != defer ]; then \
+        printf '%s\n' "  To build the image anyway:  --build-arg VERIFY_RUNTIME=defer" "" >&2; \
+        exit 1; \
+      fi; \
+      printf '%s\n' "" "MemorySanitizer: $what was not verified when this image was built." "$why" \
         "Nothing has shown that msan-musl.cfg and msan-musl-sealed.cfg work in this" \
         "image.  Run binaries linked with them natively, under an RLIMIT_AS that is" \
         "not small, before trusting them." >> /opt/asan-static/RUNTIME-UNVERIFIED; \
-      echo "msan: $1 NOT verified: see /opt/asan-static/RUNTIME-UNVERIFIED"; \
+      echo "msan: $what NOT verified: see /opt/asan-static/RUNTIME-UNVERIFIED"; \
     }; \
     printf 'int main(void){for(;;);}\n' > /tmp/msan_probe.c; \
     clang --config=/opt/asan-static/musl.cfg /tmp/msan_probe.c -o /tmp/msan_probe; \
     /tmp/msan_probe & probe=$!; sleep 1; \
     probe_exe=$(readlink "/proc/$probe/exe" || true); kill -9 "$probe"; wait "$probe" 2>/dev/null || true; \
+    if [ -z "$probe_exe" ]; then \
+      deferral "every run (clean and umr, plain and sealed)" \
+        "The build could not read /proc/<pid>/exe of a probe, so it could not tell whether the target's binaries run natively, and none was run." \
+        "  This build could not read /proc/$probe/exe of a static probe, so it" \
+        "  cannot tell whether the target's binaries run natively or under" \
+        "  emulation.  MemorySanitizer's fixed layout does not hold under" \
+        "  qemu-user, so none of the MSan binaries was run and whether MSan works" \
+        "  in this image has not been tested either way.  The compiles and links" \
+        "  succeeded."; \
+      exit 0; \
+    fi; \
     if [ "$probe_exe" != /tmp/msan_probe ]; then \
-      printf '%s\n' "" \
+      deferral "every run (clean and umr, plain and sealed)" \
+        "The build ran the target's binaries through $probe_exe (binfmt_misc emulation), under which MSan's fixed layout does not hold, so none was run." \
         "  This build runs the target's binaries through $probe_exe" \
         "  (binfmt_misc emulation), not natively.  MemorySanitizer's fixed layout" \
         "  does not hold under qemu-user, so none of the MSan binaries was run and" \
         "  whether MSan works in this image has not been tested either way.  The" \
         "  compiles and links succeeded.  Build on a machine of the target's own" \
-        "  architecture to have it checked." "" >&2; \
-      if [ "$VERIFY_RUNTIME" != defer ]; then \
-        printf '%s\n' "  To build the image anyway:  --build-arg VERIFY_RUNTIME=defer" "" >&2; \
-        exit 1; \
-      fi; \
-      unverified "every run (clean and umr, plain and sealed)" \
-        "The build ran the target's binaries through $probe_exe (binfmt_misc emulation), under which MSan's fixed layout does not hold, so none was run."; \
+        "  architecture to have it checked."; \
       exit 0; \
     fi; \
     ulimit -v unlimited 2>/dev/null || true; \
@@ -1362,18 +1388,14 @@ RUN set -eu; \
       if [ "$vlimit" = unlimited ] || [ $((spin + aslim)) -eq 0 ]; then \
         echo "$label: no run of $MSAN_RUNS passed, and a constrained address space is not why" >&2; exit 1; \
       fi; \
-      printf '%s\n' "" \
+      deferral "$label" \
+        "The build ran under an RLIMIT_AS of ${vlimit}KB and no run of it passed: $spin spun, $aslim could not map the shadow." \
         "  No run of $label passed, so whether MemorySanitizer works in it has not" \
         "  been tested either way.  This build's address space limit is ${vlimit}KB;" \
         "  MSan's shadow is TBs, a sealed MSan binary spins when its reservation is" \
         "  refused, and a plain one cannot map its shadow.  A container inherits" \
         "  RLIMIT_AS from the daemon: see the ASan check's message above for how to" \
-        "  lift it." "" >&2; \
-      if [ "$VERIFY_RUNTIME" != defer ]; then \
-        printf '%s\n' "  To build the image anyway:  --build-arg VERIFY_RUNTIME=defer" "" >&2; \
-        exit 1; \
-      fi; \
-      unverified "$label" "The build ran under an RLIMIT_AS of ${vlimit}KB and no run of it passed: $spin spun, $aslim could not map the shadow."; \
+        "  lift it."; \
     }; \
     msan_check clean/plain  /tmp/msan_clean        clean plain; \
     msan_check umr/plain    /tmp/msan_umr          umr   plain; \

@@ -1,4 +1,4 @@
-From e0a844c0dde12b38629aaeadfbb78fc106aa0873 Mon Sep 17 00:00:00 2001
+From 53734c6951b6871a0930238006cfc9ad77313398 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:05:00 +0000
 Subject: [PATCH] [compiler-rt] sealed init: record __msan_init's frame
@@ -34,8 +34,9 @@ died on
 
   MemorySanitizer: CHECK failed: msan_thread.cpp:26 "((AddrIsInStack((uptr)&local))) != (0)"
 
-With the call: 0 of 80 and 0 of 80, and 0 of 40 and 0 of 40 again with
-vm.mmap_rnd_bits=32.
+With the call, no run failed that CHECK.  (A sealed run can still spin at
+start-up on some hosts; that is the reservation in 0027, not this, and
+README.md's "Known limitation" describes it.)
 ---
  compiler-rt/lib/msan/msan.cpp | 14 ++++++++++++++
  1 file changed, 14 insertions(+)

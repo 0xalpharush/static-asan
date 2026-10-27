@@ -1,4 +1,4 @@
-From b022028975be6b5ce0c4d78aa245f21e2cfe3e71 Mon Sep 17 00:00:00 2001
+From a6cb35f087fc9a8dee88a43ca1f9f14464657f55 Mon Sep 17 00:00:00 2001
 From: 0xalpharush <0xalpharush@protonmail.com>
 Date: Mon, 26 Oct 2026 12:10:00 +0000
 Subject: [PATCH] [compiler-rt] msan: a sealed start-up
@@ -24,8 +24,10 @@ these binaries are verified against admits.  SealedReserveShadow instead
 reserves every SHADOW and mapped-ORIGIN range readable-writable and every
 INVALID and unmapped-ORIGIN range PROT_NONE, each with MAP_FIXED_NOREPLACE, and
 spins on refusal via the common SealedHangOnAllocationFailure -- the shape of
-0019's SealedReserveShadow for ASan.  The map/protect rule is one helper,
-LayoutRangeAction, which InitShadow now uses too, so the two cannot disagree.
+0019's SealedReserveShadow for ASan.  The rule for each range is one helper,
+LayoutRangeAction, whose action covers every range type (map, protect,
+allocator, app); InitShadow and the sealed reservation both switch on it, so
+the two cannot disagree.
 
 Three things differ from asan and all three matter:
 
@@ -50,8 +52,8 @@ Three things differ from asan and all three matter:
     InitializeFlags() and InitializeInterceptors() had already made unhinted
     mappings -- which the kernel could put inside the allocator range.
     __msan_get_track_origins() reads a link-time symbol, not a flag, so it is
-    known there.  The later InitShadowWithReExec call finds the layout reserved
-    and does nothing.
+    known there.  SealedReserveShadow is called once, there, and a sealed run
+    does not call InitShadowWithReExec at all.
 
   - The symbolizer is not created at start-up.  __msan_init used to call
     Symbolizer::GetOrInit()->AddHooks(...) unconditionally, and creating the
@@ -92,21 +94,11 @@ With an unlimited stack the kernel's legacy bottom-up layout can start inside
 MSan's shadow, and the reservation then refuses: the sealed spin, which
 README.md's "Known limitation" describes.
 
-Measured, x86_64, Linux 6.8, the sealed clean and uninitialized-read programs of
-the Dockerfile's MSan check, run directly on the host (no seccomp), ASLR on,
-40 runs each:
-
-  vm.mmap_rnd_bits=32.  The first version of this patch (reservation inside
-  InitShadowWithReExec, allocator range open): clean 24 passed, 16 SIGSEGV;
-  uninitialized read 35 reported and aborted (134), 5 SIGSEGV.  This version:
-  clean 40 passed; uninitialized read 40 reported once and aborted (134).  No
-  SIGSEGV, no spin.
-  vm.mmap_rnd_bits=28: 40 and 40 passed, with either version.
-
-Inside a container with Docker's default seccomp profile, at
-vm.mmap_rnd_bits=32, the Dockerfile's check with 40 runs per binary: sealed
-clean 40 and sealed uninitialized read 40 passed; the plain binaries passed 33
-and 28 times, and every other run was the re-exec the profile refuses.
+Whether a sealed run gets past this reservation depends on where the kernel
+put its own start-up mappings; how often it spins, and on which hosts, is in
+README.md's "Known limitation".  At vm.mmap_rnd_bits=32 the first version of
+this patch, which reserved inside InitShadowWithReExec and left the allocator
+range open, died by SIGSEGV on some runs; this version does not.
 
 strace, sealed.  A clean run makes no newfstatat or open for llvm-symbolizer;
 an uninitialized-read run looks for it once, after the report has begun, and
@@ -122,14 +114,14 @@ program's trace had three 8 MiB MAP_FIXED mappings inside shadow-3: the
 unpoisoning of the sealed main-thread stack window at start-up, and two for the
 allocation.
 ---
- compiler-rt/lib/msan/msan.cpp           | 115 +++++++++++++++++++-
- compiler-rt/lib/msan/msan.h             |   8 ++
+ compiler-rt/lib/msan/msan.cpp           | 120 ++++++++++++++++-
+ compiler-rt/lib/msan/msan.h             |  11 ++
  compiler-rt/lib/msan/msan_allocator.cpp |  17 +++
- compiler-rt/lib/msan/msan_linux.cpp     | 135 ++++++++++++++++++++++--
- 4 files changed, 265 insertions(+), 10 deletions(-)
+ compiler-rt/lib/msan/msan_linux.cpp     | 166 ++++++++++++++++++++----
+ 4 files changed, 284 insertions(+), 30 deletions(-)
 
 diff --git a/compiler-rt/lib/msan/msan.cpp b/compiler-rt/lib/msan/msan.cpp
-index 161a8d708..3ebf0e5a6 100644
+index 161a8d708..50658939e 100644
 --- a/compiler-rt/lib/msan/msan.cpp
 +++ b/compiler-rt/lib/msan/msan.cpp
 @@ -102,6 +102,27 @@ namespace __msan {
@@ -239,7 +231,7 @@ index 161a8d708..3ebf0e5a6 100644
  }
  
  void PrintWarningWithOrigin(uptr pc, uptr bp, u32 origin) {
-@@ -487,6 +573,18 @@ void __msan_init() {
+@@ -487,6 +573,21 @@ void __msan_init() {
    uptr msan_init_frame;
    SealedSetInitFrame(reinterpret_cast<uptr>(&msan_init_frame));
  
@@ -250,15 +242,18 @@ index 161a8d708..3ebf0e5a6 100644
 +  // kernel outside the reservation; reserved later, the runtime's own first
 +  // mappings could land in the allocator's fixed range and be replaced by the
 +  // allocator's MAP_FIXED.  __msan_get_track_origins() reads a link-time
-+  // symbol, not a flag, so it is settled already.  The call to
-+  // InitShadowWithReExec further down then does nothing.
++  // symbol, not a flag, so it is settled already.  A sealed run does not call
++  // InitShadowWithReExec further down: its dry run could neither fail nor
++  // justify a re-exec (MemoryRangeIsAvailable answers yes unasked, patch
++  // 0012), and the re-exec would run /proc/self/exe with the empty argv and
++  // environment sealed mode returns.
 +  if (SealedInit())
-+    InitShadowWithReExec(__msan_get_track_origins());
++    SealedReserveShadow(__msan_get_track_origins());
 +
    AvoidCVE_2016_2143();
  
    CacheBinaryName();
-@@ -506,7 +604,13 @@ void __msan_init() {
+@@ -506,7 +607,13 @@ void __msan_init() {
    InstallAtExitHandler(); // Needs __cxa_atexit interceptor.
  
    DisableCoreDumperIfNecessary();
@@ -273,7 +268,16 @@ index 161a8d708..3ebf0e5a6 100644
      VPrintf(1, "Unlimited stack, doing reexec\n");
      // A reasonably large stack size. It is bigger than the usual 8Mb, because,
      // well, the program could have been run with unlimited stack for a reason.
-@@ -527,8 +631,13 @@ void __msan_init() {
+@@ -517,7 +624,7 @@ void __msan_init() {
+   __msan_clear_on_return();
+   if (__msan_get_track_origins())
+     VPrintf(1, "msan_track_origins\n");
+-  if (!InitShadowWithReExec(__msan_get_track_origins())) {
++  if (!SealedInit() && !InitShadowWithReExec(__msan_get_track_origins())) {
+     Printf("FATAL: MemorySanitizer can not mmap the shadow memory.\n");
+     Printf("FATAL: Make sure to compile with -fPIE and to link with -pie.\n");
+     Printf("FATAL: Disabling ASLR is known to cause this error.\n");
+@@ -527,8 +634,13 @@ void __msan_init() {
      Die();
    }
  
@@ -290,10 +294,17 @@ index 161a8d708..3ebf0e5a6 100644
    InitializeCoverage(common_flags()->coverage, common_flags()->coverage_dir);
  
 diff --git a/compiler-rt/lib/msan/msan.h b/compiler-rt/lib/msan/msan.h
-index 7fb58be67..8d35c92e1 100644
+index 7fb58be67..8a1dd0bbf 100644
 --- a/compiler-rt/lib/msan/msan.h
 +++ b/compiler-rt/lib/msan/msan.h
-@@ -268,6 +268,12 @@ char *GetProcSelfMaps();
+@@ -264,10 +264,19 @@ extern int msan_report_count;
+ 
+ bool ProtectRange(uptr beg, uptr end);
+ bool InitShadowWithReExec(bool init_origins);
++// Sealed init's replacement for InitShadowWithReExec, called once, from the top
++// of __msan_init; see msan_linux.cpp.
++void SealedReserveShadow(bool init_origins);
+ char *GetProcSelfMaps();
  void InitializeInterceptors();
  
  void MsanAllocatorInit();
@@ -306,7 +317,7 @@ index 7fb58be67..8d35c92e1 100644
  void MsanDeallocate(BufferedStackTrace *stack, void *ptr);
  
  void *msan_malloc(uptr size, BufferedStackTrace *stack);
-@@ -330,6 +336,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
+@@ -330,6 +339,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
    GET_STORE_STACK_TRACE_PC_BP(StackTrace::GetCurrentPc(), GET_CURRENT_FRAME())
  
  #define GET_FATAL_STACK_TRACE_PC_BP(pc, bp)                              \
@@ -314,7 +325,7 @@ index 7fb58be67..8d35c92e1 100644
    UNINITIALIZED BufferedStackTrace stack;                                \
    if (msan_inited) {                                                     \
      stack.Unwind(pc, bp, nullptr, common_flags()->fast_unwind_on_fatal); \
-@@ -341,6 +348,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
+@@ -341,6 +351,7 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
  // Unwind the stack for fatal error, as the parameter `stack` is
  // empty without origins.
  #define GET_FATAL_STACK_TRACE_IF_EMPTY(STACK)                                 \
@@ -351,7 +362,7 @@ index d7d4967c9..5d6ac4c2b 100644
    SetAllocatorMayReturnNull(common_flags()->allocator_may_return_null);
    allocator.Init(common_flags()->allocator_release_to_os_interval_ms);
 diff --git a/compiler-rt/lib/msan/msan_linux.cpp b/compiler-rt/lib/msan/msan_linux.cpp
-index 7140de7e9..c10417944 100644
+index 7140de7e9..dabcb31fb 100644
 --- a/compiler-rt/lib/msan/msan_linux.cpp
 +++ b/compiler-rt/lib/msan/msan_linux.cpp
 @@ -34,9 +34,18 @@
@@ -373,35 +384,39 @@ index 7140de7e9..c10417944 100644
  namespace __msan {
  
  void ReportMapRange(const char *descr, uptr beg, uptr size) {
-@@ -112,6 +121,27 @@ static void CheckMemoryLayoutSanity() {
+@@ -112,6 +121,31 @@ static void CheckMemoryLayoutSanity() {
    }
  }
  
-+// What start-up does with one range of kMemoryLayout: a SHADOW range, and an
-+// ORIGIN range when origins are tracked, is mapped readable-writable; an
-+// INVALID range, and an ORIGIN range when they are not, is protected; APP and
-+// ALLOCATOR ranges are neither.  One rule for InitShadow and for the sealed
-+// reservation below, so that the two cannot disagree.
-+enum class RangeAction { kNone, kMap, kProtect };
++// What start-up does with one range of kMemoryLayout, for every range type: a
++// SHADOW range, and an ORIGIN range when origins are tracked, is mapped
++// readable-writable (kMap); an INVALID range, and an ORIGIN range when they
++// are not, is protected (kProtect); the ALLOCATOR range is the primary
++// allocator's, mapped later by the allocator itself (kAllocator); an APP range
++// is the program's and is left alone (kApp).  One rule for InitShadow and for
++// the sealed reservation below, so that the two cannot disagree.
++enum class RangeAction { kMap, kProtect, kAllocator, kApp };
 +
 +static RangeAction LayoutRangeAction(MappingDesc::Type type, bool init_origins) {
-+  bool map = type == MappingDesc::SHADOW ||
-+             (init_origins && type == MappingDesc::ORIGIN);
-+  bool protect = type == MappingDesc::INVALID ||
-+                 (!init_origins && type == MappingDesc::ORIGIN);
-+  CHECK(!(map && protect));
-+  if (map)
-+    return RangeAction::kMap;
-+  if (protect)
-+    return RangeAction::kProtect;
-+  CHECK(type == MappingDesc::APP || type == MappingDesc::ALLOCATOR);
-+  return RangeAction::kNone;
++  switch (type) {
++    case MappingDesc::SHADOW:
++      return RangeAction::kMap;
++    case MappingDesc::ORIGIN:
++      return init_origins ? RangeAction::kMap : RangeAction::kProtect;
++    case MappingDesc::INVALID:
++      return RangeAction::kProtect;
++    case MappingDesc::ALLOCATOR:
++      return RangeAction::kAllocator;
++    case MappingDesc::APP:
++      return RangeAction::kApp;
++  }
++  UNREACHABLE("unknown MappingDesc type");
 +}
 +
  static bool InitShadow(bool init_origins, bool dry_run) {
    // Let user know mapping parameters first.
    VPrintf(1, "__msan_init %p\n", reinterpret_cast<void *>(&__msan_init));
-@@ -140,14 +170,10 @@ static bool InitShadow(bool init_origins, bool dry_run) {
+@@ -140,38 +174,118 @@ static bool InitShadow(bool init_origins, bool dry_run) {
      if (start >= maxVirtualAddress)
        continue;
  
@@ -410,16 +425,53 @@ index 7140de7e9..c10417944 100644
 -    bool protect = type == MappingDesc::INVALID ||
 -                   (!init_origins && type == MappingDesc::ORIGIN);
 -    CHECK(!(map && protect));
-+    const RangeAction action = LayoutRangeAction(type, init_origins);
-+    bool map = action == RangeAction::kMap;
-+    bool protect = action == RangeAction::kProtect;
-     if (!map && !protect) {
+-    if (!map && !protect) {
 -      CHECK(type == MappingDesc::APP || type == MappingDesc::ALLOCATOR);
 -
-       if (dry_run && type == MappingDesc::ALLOCATOR &&
-           !CheckMemoryRangeAvailability(start, size, !dry_run))
-         return false;
-@@ -172,7 +198,102 @@ static bool InitShadow(bool init_origins, bool dry_run) {
+-      if (dry_run && type == MappingDesc::ALLOCATOR &&
+-          !CheckMemoryRangeAvailability(start, size, !dry_run))
+-        return false;
+-    }
+-    if (map) {
+-      if (dry_run && !CheckMemoryRangeAvailability(start, size, !dry_run))
+-        return false;
+-      if (!dry_run &&
+-          !MmapFixedSuperNoReserve(start, size, kMemoryLayout[i].name))
+-        return false;
+-      if (!dry_run && common_flags()->use_madv_dontdump)
+-        DontDumpShadowMemory(start, size);
+-    }
+-    if (protect) {
+-      if (dry_run && !CheckMemoryRangeAvailability(start, size, !dry_run))
+-        return false;
+-      if (!dry_run && !ProtectMemoryRange(start, size, kMemoryLayout[i].name))
+-        return false;
++    switch (LayoutRangeAction(type, init_origins)) {
++      case RangeAction::kMap:
++        if (dry_run && !CheckMemoryRangeAvailability(start, size, !dry_run))
++          return false;
++        if (!dry_run &&
++            !MmapFixedSuperNoReserve(start, size, kMemoryLayout[i].name))
++          return false;
++        if (!dry_run && common_flags()->use_madv_dontdump)
++          DontDumpShadowMemory(start, size);
++        break;
++      case RangeAction::kProtect:
++        if (dry_run && !CheckMemoryRangeAvailability(start, size, !dry_run))
++          return false;
++        if (!dry_run &&
++            !ProtectMemoryRange(start, size, kMemoryLayout[i].name))
++          return false;
++        break;
++      case RangeAction::kAllocator:
++        if (dry_run && !CheckMemoryRangeAvailability(start, size, !dry_run))
++          return false;
++        break;
++      case RangeAction::kApp:
++        break;
+     }
+   }
+ 
    return true;
  }
  
@@ -442,13 +494,9 @@ index 7140de7e9..c10417944 100644
 +  DecreaseTotalMmap(size);  // Not counted against mmap_limit_mb, as ever.
 +}
 +
-+// Set once the sealed layout is reserved.  __msan_init reserves it first thing
-+// and calls InitShadowWithReExec again later, the way an unsealed run does;
-+// that second call finds this set and does nothing.
-+static bool sealed_layout_reserved;
-+
-+// The sealed replacement for InitShadow's map/protect loop, called from the
-+// top of __msan_init, before the runtime's first allocation.  The unsealed
++// The sealed replacement for InitShadowWithReExec, called once, from the top of
++// __msan_init, before the runtime's first allocation; __msan_init does not call
++// InitShadowWithReExec at all in a sealed run.  The unsealed
 +// path asks MemoryRangeIsAvailable -- a /proc read -- and then MAP_FIXEDs, but
 +// in sealed mode that question answers yes unasked (patch 0012), so the dry run
 +// cannot fail and the MAP_FIXED that follows would cover whatever the program
@@ -465,16 +513,17 @@ index 7140de7e9..c10417944 100644
 +// duplicated in kMemoryLayout), which it maps with MAP_FIXED.  Left open, a
 +// mapping the kernel placed there -- the [vdso] and [vvar] it places at exec,
 +// or any unhinted mapping the runtime makes before the allocator starts --
-+// would be replaced by that MAP_FIXED without a word.  Reserved, such a mapping is a refusal here (the spin), and
-+// the allocator's MAP_FIXED later lands on the runtime's own reservation.  So
-+// is the one piece of an APP range the allocator maps with MAP_FIXED: its
++// would be replaced by that MAP_FIXED without a word.  Reserved, such a
++// mapping is a refusal here (the spin), and the allocator's MAP_FIXED later
++// lands on the runtime's own reservation.  So is the one piece of an APP range
++// the allocator maps with MAP_FIXED: its
 +// region-info array, AdditionalSize() bytes at the end of its space, which is
 +// the end of the ALLOCATOR range (MsanAllocatorRegionInfoRange).  The rest of
 +// the APP ranges is left alone: the program is already in them.
 +//
 +// No madvise: the sealed shadow is neither MADV_DONTDUMP nor hinted
 +// (sanitizer_sealed.h).
-+static void SealedReserveShadow(bool init_origins) {
++void SealedReserveShadow(bool init_origins) {
 +  CheckMemoryLayoutSanity();
 +  const uptr maxVirtualAddress = GetMaxUserVirtualAddress();
 +  for (unsigned i = 0; i < kMemoryLayoutSize; ++i) {
@@ -489,11 +538,10 @@ index 7140de7e9..c10417944 100644
 +        SealedReserveRange(start, size, PROT_READ | PROT_WRITE);
 +        break;
 +      case RangeAction::kProtect:
++      case RangeAction::kAllocator:
 +        SealedReserveRange(start, size, PROT_NONE);
 +        break;
-+      case RangeAction::kNone:
-+        if (type == MappingDesc::ALLOCATOR)
-+          SealedReserveRange(start, size, PROT_NONE);
++      case RangeAction::kApp:
 +        break;
 +    }
 +  }
@@ -501,24 +549,15 @@ index 7140de7e9..c10417944 100644
 +  MsanAllocatorRegionInfoRange(&region_info_beg, &region_info_size);
 +  if (region_info_size && region_info_beg < maxVirtualAddress)
 +    SealedReserveRange(region_info_beg, region_info_size, PROT_NONE);
-+  sealed_layout_reserved = true;
++}
++#  else   // SANITIZER_LINUX
++// Sealed init is a Linux mode (sanitizer_sealed.h); elsewhere the ordinary
++// start-up is the only one there is.
++void SealedReserveShadow(bool init_origins) {
++  CHECK(InitShadowWithReExec(init_origins));
 +}
 +#  endif  // SANITIZER_LINUX
 +
  bool InitShadowWithReExec(bool init_origins) {
-+#  if SANITIZER_LINUX
-+  // A sealed run reserves its layout with MAP_FIXED_NOREPLACE and never
-+  // re-execs: its MemoryRangeIsAvailable answers yes unasked, so the dry run
-+  // below could neither fail nor justify a re-exec, and the re-exec would run
-+  // /proc/self/exe with the empty argv and environment sealed mode returns.
-+  // The first call, from the top of __msan_init, reserves; any later one finds
-+  // the layout reserved and does nothing.
-+  if (SealedInit()) {
-+    if (!sealed_layout_reserved)
-+      SealedReserveShadow(init_origins);
-+    return true;
-+  }
-+#  endif
    // Start with dry run: check layout is ok, but don't print warnings because
    // warning messages will cause tests to fail (even if we successfully re-exec
-   // after the warning).
