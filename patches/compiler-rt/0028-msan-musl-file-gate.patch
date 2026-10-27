@@ -1,0 +1,66 @@
+From 30e4ba2d8ca19e2477edbbfa9510e8a27bd26ac2 Mon Sep 17 00:00:00 2001
+From: 0xalpharush <0xalpharush@protonmail.com>
+Date: Mon, 26 Oct 2026 12:15:00 +0000
+Subject: [PATCH] [compiler-rt] msan: no-op unpoison_file on musl, in MSan code
+ only
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖: __sanitizer_FILE is declared with glibc's FILE field offsets, guarded by
+SANITIZER_LINUX && !SANITIZER_ANDROID, and SANITIZER_HAS_STRUCT_FILE is set when
+it is a struct.  musl's public FILE is opaque -- include/alltypes.h.in defines
+it as `struct _IO_FILE { char __x; }` -- so on musl those offsets name arbitrary
+bytes.  unpoison_file(), reached from MSan's fopen/fdopen/freopen/fmemopen/
+open_memstream/fflush/fclose interceptors, reads file->_IO_read_base and
+_IO_read_end when SANITIZER_HAS_STRUCT_FILE and memsets that range's shadow.  On
+musl those two words are not a buffer, so it writes the shadow of a wild address
+and faults.
+
+An earlier version of this change gated __sanitizer_FILE itself in
+sanitizer_platform_limits_posix.h.  That is a shared header: editing it rebuilt
+asan_interceptors.cpp.o (unpoison_file's mangled name changes there, though its
+body is one `ret`), which moved the md5 of libclang_rt.asan.a that README.md
+records, and the TSan and HWASan runtimes with it -- a change only MSan needs
+must not move the archive the OSS-Fuzz proofs' binaries were built from.
+
+So the no-op is done in MSan's own translation unit instead, just before it
+includes sanitizer_common_interceptors.inc (which defines unpoison_file), by
+turning SANITIZER_HAS_STRUCT_FILE off under SANITIZER_MUSL.  That makes
+unpoison_file the empty function it already is when the struct is absent -- the
+precedent is the Android branch of the same #if, not the msghdr/shmid_ds layout
+fixes, since musl's public FILE has no layout to describe.  No unpoisoning is
+lost: the fread/read interceptors unpoison the bytes actually read, and no
+other runtime's objects change.
+
+Measured, x86_64, Linux 6.8, ASLR on, the clean program of the Dockerfile's MSan
+check (fopen, fread, fclose of an existing file), 20 runs each.  With this
+series but this change removed: the plain binary died in 20 of 20 runs
+(MemorySanitizer: SEGV, exit 1) and the sealed binary by SIGSEGV in 20 of 20;
+under gdb the fault is in memset, called from __msan_unpoison, from
+unpoison_file, from the fclose interceptor.  With it, no run faulted there.
+---
+ compiler-rt/lib/msan/msan_interceptors.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/compiler-rt/lib/msan/msan_interceptors.cpp b/compiler-rt/lib/msan/msan_interceptors.cpp
+index 1462b2e16..76e1e73a8 100644
+--- a/compiler-rt/lib/msan/msan_interceptors.cpp
++++ b/compiler-rt/lib/msan/msan_interceptors.cpp
+@@ -1505,6 +1505,16 @@ int OnExit() {
+ 
+ #include "sanitizer_common/sanitizer_platform_interceptors.h"
+ #include "sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc"
++// musl's FILE is opaque (include/alltypes.h.in: struct _IO_FILE { char __x; }),
++// so __sanitizer_FILE's glibc offsets name arbitrary bytes there, and
++// unpoison_file() would unpoison a wild range.  Make it a no-op for MSan on
++// musl; the fread/read interceptors still unpoison the bytes read.  Done here
++// rather than in sanitizer_platform_limits_posix.h so that the other runtimes,
++// which never read the struct, are not rebuilt.
++#if SANITIZER_MUSL
++#  undef SANITIZER_HAS_STRUCT_FILE
++#  define SANITIZER_HAS_STRUCT_FILE 0
++#endif
+ #include "sanitizer_common/sanitizer_common_interceptors.inc"
+ 
+ static uptr signal_impl(int signo, uptr cb);

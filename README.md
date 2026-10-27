@@ -25,11 +25,14 @@ This is asan-static commit `385966a2672b4be07efec847baee1dd5e497b25f`, the toolc
 binaries in Theorem Labs' OSS-Fuzz proofs: asan-static `a408805db578be529ff2923ddee5a608ba9753d2`
 plus musl patch 0003, which keeps a static program's TLS block in `.bss` and replaces musl
 patch 0002. It is a fresh snapshot of that commit's `toolchain/` and `patches/`, without
-asan-static's history.
+asan-static's history, plus five compiler-rt patches (`0024`–`0028`) that add
+MemorySanitizer support to the sealed static toolchain and are not part of asan-static
+`385966a2`; they are described below and in the patch table.
 
-The snapshot differs from asan-static in three ways:
+The snapshot differs from asan-static in four ways:
 
-- The `From:` line of each patch names Theorem Labs.
+- The `From:` line of each patch names Theorem Labs, except the five MSan patches
+  `0024`–`0028`.
 - Internal references removed from commit messages and from source comments. The
   comment edits keep the number of lines the same, so no line number in the patched
   sources moves.
@@ -38,10 +41,20 @@ The snapshot differs from asan-static in three ways:
   2026-10-25 the packages it fetches for the target architecture (section 0a of the
   Dockerfile) also accept any Alpine build number of their pinned version, because
   Alpine replaced `musl-1.2.5-r12` with `r13` and the exact pin stopped the build.
+- Five compiler-rt patches, `0024`–`0028`, add MemorySanitizer support: link-time interception
+  and a wrap list for `libclang_rt.msan.a`, the musl `rlimit64` and `FILE` fixes MSan
+  needs, and a sealed start-up for MSan. They change only the MSan runtime
+  (`compiler-rt/lib/msan/*`) and two build files, `gen_wrap_list.py` and
+  `add_sanitizer_rt_wrap_list` in `SanitizerUtils.cmake`, whose output for ASan is
+  byte-identical. No shared runtime source is touched —
+  `sanitizer_platform_limits_posix.h` in particular is unchanged — so the ASan, TSan,
+  HWASan and UBSan archives, and the md5 below, do not move. `toolchain/Dockerfile`
+  also builds the MSan configs and a smoke test for them (sections 5b and 6).
 
-Both patch series apply with `patch -p1 --fuzz=0` to the pinned bases. The source
-trees that result from the two series differ in six comment lines of two files, and in
-nothing else: five in `compiler-rt/lib/asan/asan_new_delete.cpp` (patch 0023) and one in
+Both patch series apply with `patch -p1 --fuzz=0` to the pinned bases. Excluding the
+five MSan patches, which asan-static does not carry, the source trees that result from
+the two series differ in six comment lines of two files, and in nothing else: five in
+`compiler-rt/lib/asan/asan_new_delete.cpp` (patch 0023) and one in
 `compiler-rt/lib/sanitizer_common/sanitizer_sealed.h` (patch 0019).
 
 The builds of a408805d identified the toolchain by a hash over `toolchain/` and
@@ -167,7 +180,15 @@ detail.
 binary. That binary reserves about 14TiB of shadow memory on a 64-bit target. If the
 Docker daemon sets an `RLIMIT_AS` that is smaller, the binary cannot start. With
 `defer`, the image contains `/opt/asan-static/RUNTIME-UNVERIFIED`, which records that
-the check did not run.
+the check did not run. The MemorySanitizer check on x86_64 and aarch64 follows the
+same rule: when no run of one of its binaries passes under a set `RLIMIT_AS`, and the
+runs that missed could not map MSan's shadow (plain) or spun (sealed), `require`
+fails the build and `defer` appends that binary to `RUNTIME-UNVERIFIED`. A cross
+build that runs the target's binaries under `qemu-user` does not run the MSan
+binaries at all, because MSan's fixed layout does not hold under the emulator. That
+is a deferral too: `require` fails the build and `defer` appends it to
+`RUNTIME-UNVERIFIED`. riscv64 and armv7 have no MSan runtime and skip the MSan check
+entirely.
 
 ### Using the image
 
@@ -187,9 +208,14 @@ The image installs these clang config files in `/opt/asan-static/`:
 | `asan-musl-silent.cfg` | `asan-musl.cfg` with silent reports (patch 0014) |
 | `asan-musl-dynamic.cfg` | ordinary dynamic ASan with the stock runtime |
 | `asan-musl-nowrap.cfg`, `asan-musl-bfd.cfg` | two incorrect static links, for tests that require the link to fail |
+| `msan-musl.cfg` | static musl with the static MSan runtime and `libclang_rt.msan.a.wrap` (x86_64 and aarch64 only) |
+| `msan-musl-sealed.cfg` | `msan-musl.cfg` with sealed init (patches 0026 and 0027; x86_64 and aarch64 only) |
 
 The sealed and silent configs use the same runtime archive as `asan-musl.cfg`. Each
-adds one `--defsym` to the link.
+adds one `--defsym` to the link. `msan-musl-sealed.cfg` likewise uses the same
+runtime archive and wrap list as `msan-musl.cfg` and adds one `--defsym`. The MSan
+configs exist only on the targets for which compiler-rt 20.1.8 builds an MSan
+runtime.
 
 `asan-musl.cfg`, `asan-musl-sealed.cfg` and `asan-musl-silent.cfg` compile and link C++
 against a second libc++ and libc++abi, built with ASan, in
@@ -206,17 +232,27 @@ then report `container-overflow`. To turn the check off, set `detect_container_o
 in `ASAN_OPTIONS` for `asan-musl.cfg`, and in the program's own
 `__asan_default_options()` for a sealed binary, which reads no environment (patch 0012).
 
+`msan-musl.cfg` and `msan-musl-sealed.cfg` link C++ against the default libc++, which is
+not built with MemorySanitizer. MSan needs every instruction that touches memory to be
+instrumented, so C++ that uses libc++ (`std::string` included) reports
+`use-of-uninitialized-value` for correct code. Use the MSan configs for C.
+
 ## Cross-building
 
 The image runs on the build machine and compiles for the target. The base image is
 pinned to `$BUILDPLATFORM`, and the three arguments above name the target. You do not
 need target hardware or an emulator to build the image.
 
-Three verification steps at the end of the Dockerfile run target binaries. On a cross
-build, the build machine must be able to run them. On Linux, register `qemu-user`
-with `binfmt_misc` for the target, for example with the `qemu-user-static` package or
-with `docker run --privileged tonistiigi/binfmt --install <arch>`. Only these three
-steps need the emulator.
+Five verification steps at the end of the Dockerfile run target binaries; the fifth,
+the MemorySanitizer check, exists only on x86_64 and aarch64. On a cross build, the
+build machine must be able to run them. On Linux, register `qemu-user` with
+`binfmt_misc` for the target, for example with the `qemu-user-static` package or with
+`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these five steps
+need the emulator. The MSan check detects the emulator and does not run its binaries
+under it. With the default `VERIFY_RUNTIME=require` that fails the build; with
+`VERIFY_RUNTIME=defer` the check records them in
+`/opt/asan-static/RUNTIME-UNVERIFIED` instead. Build aarch64 on an aarch64 machine to
+have MSan checked.
 
 `--build-arg TOOLCHAIN_PLATFORM=linux/<arch> --platform linux/<arch>` builds the
 image on the target architecture under emulation instead. This gives the same
@@ -283,6 +319,11 @@ through the same interceptor as before.
 | `compiler-rt/0021` | Makes lld extract the real libc function at parse time, so that a weakly referenced function is not left null. |
 | `compiler-rt/0022` | Sealed: repairs the arena reservation after a refused commit, and returns the program's NULL. |
 | `compiler-rt/0023` | Sealed: the throwing forms of `operator new` throw `std::bad_alloc` when the allocation is refused. |
+| `compiler-rt/0024` | Gives MSan the same link-time interception asan has: `SANITIZER_STATIC_INTERCEPTION` for msan's cflags, a `clang_rt.msan` wrap list, and a per-runtime present-symbol (`__msan_wrap_list_present`) that `add_sanitizer_rt_wrap_list` passes to `gen_wrap_list.py` and `__msan_init` references from code, so a static-musl MSan link attaches its interceptors with `ld --wrap` and a link without the list fails, also with `--gc-sections`. |
+| `compiler-rt/0025` | On musl, reads the `getrlimit64`/`prlimit64` result through `struct_rlimit_sz` (musl's `rlimit64` is `rlimit`) instead of the glibc-only `struct_rlimit64_sz`, whose undefined symbol otherwise fails every static-musl MSan link. |
+| `compiler-rt/0026` | Sealed: `__msan_init` records its frame like `__asan_init`. On x86_64/aarch64 this sets the top of the sealed main-thread stack window that `MsanThread::Init`'s `CHECK(AddrIsInStack())` reads; without it that check failed in 6 of 80 sealed runs (x86_64). |
+| `compiler-rt/0027` | Sealed: gives MSan a sealed start-up. At the top of `__msan_init`, before the runtime's first mapping, it reserves the shadow, origin, invalid and allocator ranges, and the allocator's region-info array above them, with `MAP_FIXED_NOREPLACE` and spins on refusal (like asan's `SealedReserveShadow`); it pins the common flags asan's `SealFlags` pins, `clear_shadow_mmap_threshold` included, so no signal handler is installed, a detection dies by `SIGABRT` and the shadow is never re-mapped; it creates the symbolizer only when a report needs it, so start-up does not look for `llvm-symbolizer`; and it makes `ReExec` unreachable. |
+| `compiler-rt/0028` | MSan-only: turns `SANITIZER_HAS_STRUCT_FILE` off under `SANITIZER_MUSL` inside `msan_interceptors.cpp` (not the shared header), so `unpoison_file` is a no-op on musl without rebuilding any other runtime. |
 
 ## Known limitation: the sealed runtime spins when it cannot get memory
 
@@ -309,15 +350,43 @@ These cases are not affected:
 Later versions of asan-static replace the spin with `SIGABRT`. This snapshot does not
 include that change, because the OSS-Fuzz proofs' binaries were built without it.
 
+A binary linked with `msan-musl-sealed.cfg` also spins, with no output, when one of
+the mappings the kernel makes at start-up falls inside MSan's ranges. MSan's x86_64
+and aarch64 layouts have fixed shadow, origin and allocator ranges. Before `main`,
+the sealed runtime reserves all of them with `MAP_FIXED_NOREPLACE` (patch 0027). A
+mapping already there is a refusal, and a sealed runtime may not re-exec to move
+it, so the process spins. A plain MSan binary re-execs with ASLR off instead.
+Measured on an x86_64 kernel that places `[vvar]` and `[vdso]` in the mmap area:
+
+- with `vm.mmap_rnd_bits=32`, about one run in four (31 of 120) spins;
+- with an unlimited stack limit (`ulimit -s unlimited`), every run spins. The kernel
+  then uses the legacy bottom-up layout, which starts inside MSan's shadow.
+
+Use a timeout when you run sealed MSan binaries, as for sealed ASan. A sealed MSan
+detection aborts with `SIGABRT`, and the runtime does not lower `RLIMIT_CORE`, so the
+process dumps core unless you turn core dumps off (`ulimit -c 0`, or
+`setrlimit(RLIMIT_CORE)` and `prctl(PR_SET_DUMPABLE, 0)` in the program). Where
+`core_pattern` pipes to a handler, writing that core can take longer than the
+timeout.
+
 ## CI
 
 The [CI](.github/workflows/ci.yml) workflow builds the image for each of the four
 targets on each push to `main`, on each pull request and once a week. The last steps of
 `toolchain/Dockerfile` are the tests. A static musl binary runs, a static ASan binary
-reports an overflow that only a live interceptor can report, and a link without the
-wrap list fails. The cross targets run these steps under `qemu-user`. After the
+reports an overflow that only a live interceptor can report, a link without the wrap
+list fails, and a sealed ASan C++ program reports a `std::string` container-overflow
+while a correct one does not. On x86_64 and aarch64 an MSan step follows: it runs a clean program
+and an uninitialized-read program, each linked plain and sealed, twelve times each,
+requires at least one pass of each and accepts no outcome other than a pass or a
+known miss (the sealed spin above, or the re-exec that the build's seccomp profile
+refuses), and requires that an MSan link with `--gc-sections` and without the wrap
+list fails. x86_64 and aarch64 build on runners of their own architecture
+(`ubuntu-24.04` and `ubuntu-24.04-arm`), so these steps run natively. riscv64 and
+armv7 are cross-built on x86_64 and run their steps under `qemu-user`. After the
 build, CI links a program with `asan-musl.cfg` and checks that the binary has no
-`PT_INTERP`, no `DT_NEEDED` and no dynamic symbol table. riscv64 is built with the
+`PT_INTERP`, no `DT_NEEDED` and no dynamic symbol table, and checks that the image
+has no `RUNTIME-UNVERIFIED`. riscv64 is built with the
 arguments of the OSS-Fuzz proofs' toolchain, except that `VERIFY_RUNTIME` stays
 `require`. Runs reuse Docker's layer cache from earlier runs on `main`; the weekly run
 uses no layer cache and rebuilds everything.
