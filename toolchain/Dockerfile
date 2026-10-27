@@ -474,6 +474,7 @@ RUN cmake -S /llvm-project/runtimes -B /build/libunwind -G Ninja \
 RUN cmake -S /llvm-project/runtimes -B /build/libcxx -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DLLVM_ENABLE_RUNTIMES="libunwind;libcxxabi;libcxx" \
+      -DLLVM_USE_SANITIZER=Address \
       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang \
       -DCMAKE_C_COMPILER_TARGET="$TRIPLE" \
       -DCMAKE_CXX_COMPILER_TARGET="$TRIPLE" \
