@@ -199,8 +199,11 @@ RUN apk add --no-cache \
         clang20~20.1.8 \
         lld20~20.1.8 \
         llvm20~20.1.8 \
+        bash~5.2 \
         cmake~3.31 \
+        meson~1.8 \
         ninja-build~1.12 \
+        pkgconf~2.4 \
         build-base~0.5 \
         linux-headers~6.14 \
         alpine-keys~2.5 \
