@@ -206,6 +206,7 @@ RUN apk add --no-cache \
         alpine-keys~2.5 \
         git~2.49 \
         python3~3.12 \
+        openjdk21-jre-headless~21.0 \
         patch~2.8 \
         file~5.46 \
         docker-cli~28.3 \
