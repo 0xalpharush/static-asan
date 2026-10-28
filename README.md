@@ -189,7 +189,8 @@ same rule: when no run of one of its binaries passes under a set `RLIMIT_AS`, an
 runs that missed could not map MSan's shadow (plain) or spun (sealed), `require`
 fails the build and `defer` appends that binary to `RUNTIME-UNVERIFIED`. On riscv64 the
 same misses are a deferral also without an `RLIMIT_AS`, because riscv64's MSan layout
-needs a 47-bit user address space (see "Running an emulated image"). A cross
+cannot be held on Sv39 hardware or under `qemu-user` 8.1 or 8.2 (see "Running an
+emulated image"). A cross
 build of x86_64 or aarch64 that runs the target's binaries under `qemu-user` does not
 run the MSan binaries at all, because their fixed layout does not hold under the
 emulator. That is a deferral too: `require` fails the build and `defer` appends it to
@@ -308,7 +309,7 @@ not run its binaries under it. With the default `VERIFY_RUNTIME=require` that fa
 build; with `VERIFY_RUNTIME=defer` the check records them in
 `/opt/asan-static/RUNTIME-UNVERIFIED` instead. Build aarch64 on an aarch64 machine to
 have MSan checked. On riscv64 the MSan check runs its binaries under the emulator, which
-must be `qemu-user` 10 or later (see "Running an emulated image").
+must be `qemu-user` 9.2 or later (see "Running an emulated image").
 
 `--build-arg TOOLCHAIN_PLATFORM=linux/<arch> --platform linux/<arch>` builds the
 image on the target architecture under emulation instead. This gives the same
@@ -332,11 +333,13 @@ is not small.
 
 MSan on riscv64 needs a 47-bit user address space: its layout (patch 0029) is
 LoongArch64's, with the primary allocator at `0x700000000000`, which fits Sv48 and not
-Sv39. Under `qemu-user` that means version 10 or later. Measured: `qemu-riscv64` 8.2.2
-(Ubuntu 24.04's `qemu-user-static`) answers a program's first `mmap(NULL)` with an
-address inside MSan's shadow, so a plain MSan binary stops with "can not mmap the
-shadow" and a sealed one spins; under 10.0.11 and 10.2.3 (the `tonistiigi/binfmt` image
-that CI installs) both run. On riscv64 hardware the same holds for an Sv39 kernel.
+Sv39, so on riscv64 hardware an Sv39 kernel cannot run it. Under `qemu-user` it also
+needs the emulator to map the program above MSan's shadow, which version 9.2 and later
+do. Measured: `qemu-riscv64` 8.1.5 and 8.2.2 (Ubuntu 24.04's `qemu-user-static`) answer
+a program's first `mmap(NULL)` with `0x2aaaab2ad000`, inside MSan's shadow, so a plain
+MSan binary stops with "can not mmap the shadow" and a sealed one spins; under 9.2.0,
+9.2.2, 10.0.4, 10.0.11, 10.1.3 and 10.2.3 both run. 9.0 and 9.1 were not tried. CI
+installs `tonistiigi/binfmt:latest`, which held 10.2.3 when this was written.
 
 ## Binary size
 

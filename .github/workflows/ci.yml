@@ -9,8 +9,9 @@
 # build on a runner of their own architecture, so those steps run natively: their
 # MSan cannot run under qemu-user, and an emulated MSan step fails the build under
 # the default VERIFY_RUNTIME=require.  riscv64 and armv7 are cross-built on x86_64
-# and run their steps under qemu-user; riscv64's MSan runs there, under the qemu
-# (10 or later) that setup-qemu-action installs, and armv7 has no MSan runtime.  After the
+# and run their steps under qemu-user, riscv64's MSan step included (it needs
+# qemu-user 9.2 or later; setup-qemu-action installs tonistiigi/binfmt:latest),
+# and armv7 has no MSan runtime.  After the
 # build, one step links hello world with asan-musl.cfg and requires that the
 # binary has no PT_INTERP, no DT_NEEDED and no dynamic symbol table, and another
 # requires that the image records nothing as unverified
