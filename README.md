@@ -105,8 +105,12 @@ this repository gives the same `4880198ff493a316727c4cc1d4f78e21` as at a408805d
 the asan-static 385966a2 build, this repository's musl sysroot (`libc.a`, the start-up
 objects, libunwind, libc++ and libc++abi: 21 files) is byte-identical, and the runtime
 archives differ only in `.debug_line`, as above. The sysroot also holds a second libc++
-and libc++abi, built with ASan, in `usr/lib/asan-libcxx`. asan-static 385966a2 has no
-counterpart to it; only the static ASan configs use it (see "Using the image").
+and libc++abi, built with ASan, in `usr/lib/asan-libcxx`, and a third, built with libc++'s
+extensive hardening mode, in `usr/lib/hardened-libcxx`. The image also holds a trap-only
+`-fsanitize=vptr` handler, `/opt/ubsan-vptr-trap/libclang_rt.ubsan_vptr_trap.a`, built from
+`toolchain/ubsan_vptr_trap.cpp`. asan-static 385966a2 has no counterpart to any of the three.
+Only the static ASan configs use the ASan copy, only `musl-hardened.cfg` uses the hardened
+copy, and only `ubsan-vptr-musl.cfg` uses the handler (see "Using the image").
 
 The Alpine packages these builds installed are the ones the `~series` pins resolved to
 on the day of the build (see "Pinned versions").
@@ -203,6 +207,8 @@ The image installs these clang config files in `/opt/asan-static/`:
 | Config | Link |
 | --- | --- |
 | `musl.cfg` | static musl, no sanitizer |
+| `musl-hardened.cfg` | `musl.cfg`, with C++ against the hardened libc++ |
+| `ubsan-vptr-musl.cfg` | `musl.cfg` with `-fsanitize=vptr` checks that trap, through the trap-only handler |
 | `asan-musl.cfg` | static musl with the static ASan runtime |
 | `asan-musl-sealed.cfg` | `asan-musl.cfg` with sealed init (patch 0012) |
 | `asan-musl-silent.cfg` | `asan-musl.cfg` with silent reports (patch 0014) |
@@ -232,6 +238,47 @@ then report `container-overflow`. To turn the check off, set `detect_container_o
 in `ASAN_OPTIONS` for `asan-musl.cfg`, and in the program's own
 `__asan_default_options()` for a sealed binary, which reads no environment (patch 0012).
 
+`musl-hardened.cfg` compiles and links C++ against a libc++ and libc++abi built with
+`LIBCXX_HARDENING_MODE=extensive`, in `/opt/musl-sysroot/usr/lib/hardened-libcxx`. Its
+`__config_site` makes the extensive mode the default, so libc++ checks its preconditions: an
+index past the end of a `std::span`, `std::string_view`, `std::array` or `std::vector`, `front()`
+or `back()` of an empty container, `*` of an empty `std::optional`, an iterator range with its
+ends swapped, a null pointer with a nonzero length. A failed check executes the target's trap
+instruction and prints nothing: `SIGILL` (status 132), or `SIGTRAP` (status 133) on aarch64.
+The library itself is built hardened because `-D_LIBCPP_HARDENING_MODE=...` on the program's
+command line reaches only the code the program compiles. The members of `std::string` and of
+the streams that are compiled into `libc++.a` keep the mode the library was built with. Measured
+on riscv64: the default `libc++.a` has 6 trap instructions and the hardened one 319, and
+`std::string::find(nullptr, pos, n)` with `pos` past the end and `n` nonzero traps with this
+config and not with `musl.cfg` and the `-D` flag. The config is not for ASan links, which use
+their own copy.
+
+`ubsan-vptr-musl.cfg` adds `-fsanitize=vptr` checks without the UBSan runtime. A vptr check
+cannot be a trap in clang, because its decision reads the object's RTTI. The config passes
+`-fno-sanitize-trap=vptr -fno-sanitize-recover=vptr -fno-sanitize-link-runtime` and links
+`/opt/ubsan-vptr-trap/libclang_rt.ubsan_vptr_trap.a`, which defines only the handler that the
+checks call and the cache that they read. The handler makes compiler-rt's decision and then,
+on a mismatch, executes the trap instruction, so a bad downcast or a member call on an object of
+another dynamic type ends as a trap-mode check does. Before it reads the vtable, the type
+information and the base-class lists, it checks that each address lies inside the program's
+image, and apart from the object's own storage, it reads no address outside the image: a vtable outside it is a mismatch, and a class whose
+type information or base-class list lies outside it ends that branch of the search of the base
+classes. It makes no syscall for this. It does
+not check the object's own storage, which compiler-rt does not check either. Its search of the
+base classes follows a path at most 512 levels deep and visits at most 2^20 − 1 base classes in
+all (2^20 classes counting the one it starts from; a class that occurs more than once is counted
+each time). A limit ends only the branch it stops: the search goes on with the other bases of
+the classes it has visited, and a virtual base among them still counts as a match, as it does in
+compiler-rt. A search that ends with no match is a mismatch and traps, so a correct program whose
+match lies only past a limit traps, unless the search counts a virtual base as a match; the
+source comment says which programs those can be. Code compiled with `-fno-rtti` gets no vptr
+check.
+clang reads a config's options before the command line, so a command line that adds
+`-fsanitize-trap=all` must add `-fno-sanitize-trap=vptr` after it; clang refuses vptr in trap
+mode. A link with these flags and without the archive fails on
+`__ubsan_handle_dynamic_type_cache_miss_abort`. The config is not for ASan links:
+`-fno-sanitize-link-runtime` would drop the ASan runtime.
+
 `msan-musl.cfg` and `msan-musl-sealed.cfg` link C++ against the default libc++, which is
 not built with MemorySanitizer. MSan needs every instruction that touches memory to be
 instrumented, so C++ that uses libc++ (`std::string` included) reports
@@ -243,11 +290,12 @@ The image runs on the build machine and compiles for the target. The base image 
 pinned to `$BUILDPLATFORM`, and the three arguments above name the target. You do not
 need target hardware or an emulator to build the image.
 
-Five verification steps at the end of the Dockerfile run target binaries; the fifth,
-the MemorySanitizer check, exists only on x86_64 and aarch64. On a cross build, the
+Six verification steps at the end of the Dockerfile run target binaries; one of them,
+the MemorySanitizer check, runs them only on x86_64 and aarch64, and on riscv64 and armv7,
+which have no MSan config, it skips and prints "no msan test". On a cross build, the
 build machine must be able to run them. On Linux, register `qemu-user` with
 `binfmt_misc` for the target, for example with the `qemu-user-static` package or with
-`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these five steps
+`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these six steps
 need the emulator. The MSan check detects the emulator and does not run its binaries
 under it. With the default `VERIFY_RUNTIME=require` that fails the build; with
 `VERIFY_RUNTIME=defer` the check records them in
@@ -381,7 +429,9 @@ and an uninitialized-read program, each linked plain and sealed, twelve times ea
 requires at least one pass of each and accepts no outcome other than a pass or a
 known miss (the sealed spin above, or the re-exec that the build's seccomp profile
 refuses), and requires that an MSan link with `--gc-sections` and without the wrap
-list fails. x86_64 and aarch64 build on runners of their own architecture
+list fails. Then the hardened libc++ traps on a broken precondition and the default one
+does not, and the vptr handler traps on a bad downcast while a correct program runs and a
+link without it fails. x86_64 and aarch64 build on runners of their own architecture
 (`ubuntu-24.04` and `ubuntu-24.04-arm`), so these steps run natively. riscv64 and
 armv7 are cross-built on x86_64 and run their steps under `qemu-user`. After the
 build, CI links a program with `asan-musl.cfg` and checks that the binary has no
@@ -409,3 +459,5 @@ MIT for Theorem Labs' work: the toolchain Dockerfile, the READMEs and the change
 the patches make; see `LICENSE`. The code the patches change keeps its own licence:
 LLVM's compiler-rt is under the Apache License v2.0 with LLVM Exceptions
 (`LICENSE-LLVM.txt`), and musl is under the MIT License (`LICENSE-musl.txt`).
+`toolchain/ubsan_vptr_trap.cpp` follows compiler-rt's
+`lib/ubsan/ubsan_type_hash_itanium.cpp` and is under compiler-rt's licence.
