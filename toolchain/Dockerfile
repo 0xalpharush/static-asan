@@ -38,19 +38,19 @@
 # in section 3, which name architectures rather than being chosen per architecture,
 # and are explained there.  The one other thing that is not portable is not in this
 # file: ASan on riscv64 takes the dynamic-shadow path and its allocator reserves
-# 128GB, so the two verification steps below that run an ASan binary (the
-# interceptor check and the std::string check) need a container whose RLIMIT_AS
-# is not small.  The others do not: the plain static musl link runs, the link
-# that must fail still fails, and riscv64 has no MSan step.  A 32-bit target needs
-# none of that -- its shadow is about 512MiB.  See the "Running an emulated image"
-# section of README.md.
+# 128GB, so the three verification steps below that run an ASan binary (the
+# interceptor check, the std::string check and the stack-use-after-return check)
+# need a container whose RLIMIT_AS is not small.  The others do not: the plain
+# static musl link runs, the link that must fail still fails, and riscv64 has no
+# MSan step.  A 32-bit target needs none of that -- its shadow is about 512MiB.
+# See the "Running an emulated image" section of README.md.
 #
-# The five steps at the end run binaries for the target; the fifth, the
+# The six steps at the end run binaries for the target; the sixth, the
 # MemorySanitizer test, only on x86_64 and aarch64, the targets with an msan
 # runtime.  On a native build that is nothing to arrange; on a cross build the
 # machine has to be able to execute them, which on Linux means binfmt_misc with
 # qemu-user registered -- `docker run --privileged tonistiigi/binfmt --install
-# <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these five
+# <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these six
 # steps need it.  Nothing the image is for does.  MSan cannot run under
 # qemu-user at all (qemu places the guest stack inside MSan's fixed ranges), so
 # the MSan step detects emulation and does not run its binaries; it treats that
@@ -1319,6 +1319,96 @@ RUN set -eu; \
       [ "$(/tmp/string-ok)" = 20 ]; \
       echo "std::string container-overflow is reported; a correct program does not report"; \
     fi
+
+# ...and that a sealed ASan program reports a stack use-after-return.  The
+# OSS-Fuzz proofs' builds pass no -fsanitize-address-use-after-return, so clang
+# instruments in its default mode, "runtime": a function with addressable locals
+# reads __asan_option_detect_stack_use_after_return on entry and, when it is set,
+# takes its frame from the thread's fake stack, whose frames are poisoned when
+# the function returns.  That flag is the runtime's detect_stack_use_after_return,
+# which compiler-rt 20.1.8 defaults to 1 on Linux (asan_flags.inc) and which
+# sealed init leaves alone (SealFlags does not pin it).  The runtime then maps
+# the main thread's fake stack during start-up: one mmap with no address hint,
+# 11571200 bytes on x86_64 and on riscv64 (max_uar_stack_size_log 20 over the
+# 8MiB sealed main-thread stack).  So the check is on in every sealed
+# binary only through two defaults, one in clang and one in the runtime, and a
+# change to either removes it without any other sign.  This step is the sign.
+#
+# One source, four sealed binaries, all at -Os as the proofs' harnesses are
+# built:
+#
+#   uar-bad     f() leaves a pointer to its local in a global and returns, g()
+#               runs in the same stack space, then main reads through the
+#               pointer.  A pass is the stack-use-after-return report and exit
+#               134 (SIGABRT, patch 0012).
+#   uar-silent  uar-bad linked with --defsym=__sanitizer_silent_reports=1 as
+#               well, the link the proofs' asan builds use.  A pass is exit 134
+#               and no output from the program (patch 0014); the log may hold
+#               the shell's own "Aborted", which is not the program's.
+#   uar-ok      the same calls, then a read of a live local.  A pass is exit 0
+#               and the line "5".
+#   uar-never   uar-bad compiled with -fsanitize-address-use-after-return=never,
+#               the control.  f()'s frame is then on the real stack, the read
+#               finds the dead local's 7 there, and nothing reports, so the
+#               report above comes from the fake stack and from nothing else in
+#               the program.  A pass is exit 0 and the line "7".
+#
+# The program turns off its own core dump before it can abort, as the
+# std::string check's does.  Each run is under `timeout -s KILL`; the image's
+# timeout is busybox's, so a run it stops ends by 137, which fails here like
+# any other wrong status.  As with the std::string programs, the binaries are
+# always built and are run only when the interceptor check ran its binary: the
+# RUNTIME-UNVERIFIED line tested is the one that check writes, so a deferral
+# recorded by any other step does not skip this one.
+RUN set -eu; \
+    printf '%s\n' \
+      '#include <stdio.h>' \
+      '#include <sys/prctl.h>' \
+      '#include <sys/resource.h>' \
+      'static volatile int *volatile left;' \
+      '__attribute__((noinline)) static void f(void) { volatile int x[8]; x[3] = 7; left = x; }' \
+      '__attribute__((noinline)) static void g(void) { volatile char b[48]; for (int i = 0; i < 48; i++) b[i] = (char)i; }' \
+      'int main(void) {' \
+      '  struct rlimit r = {0, 0};' \
+      '  setrlimit(RLIMIT_CORE, &r);' \
+      '  prctl(PR_SET_DUMPABLE, 0);' \
+      '  f();' \
+      '  g();' \
+      '  volatile int live[8];' \
+      '  live[3] = 5;' \
+      '#ifdef READ_DEAD' \
+      '  printf("%d\n", left[3]);' \
+      '#else' \
+      '  printf("%d\n", live[3]);' \
+      '#endif' \
+      '  return 0;' \
+      '}' > /tmp/uar.c; \
+    sealed="clang --config=/opt/asan-static/asan-musl-sealed.cfg -Os"; \
+    $sealed -DREAD_DEAD /tmp/uar.c -o /tmp/uar-bad; \
+    $sealed -DREAD_DEAD -Wl,--defsym=__sanitizer_silent_reports=1 /tmp/uar.c -o /tmp/uar-silent; \
+    $sealed /tmp/uar.c -o /tmp/uar-ok; \
+    $sealed -DREAD_DEAD -fsanitize-address-use-after-return=never /tmp/uar.c -o /tmp/uar-never; \
+    if grep -qs "^The interceptors in this image were not verified" /opt/asan-static/RUNTIME-UNVERIFIED; then \
+      echo "stack-use-after-return: built, not run (RUNTIME-UNVERIFIED)"; \
+      exit 0; \
+    fi; \
+    st=0; timeout -s KILL 120 /tmp/uar-bad > /tmp/uar-bad.log 2>&1 || st=$?; \
+    if [ "$st" != 134 ] || ! grep -q "ERROR: AddressSanitizer: stack-use-after-return" /tmp/uar-bad.log; then \
+      echo "a read of a returned frame's local did not report stack-use-after-return (exit $st):" >&2; \
+      cat /tmp/uar-bad.log >&2; exit 1; \
+    fi; \
+    st=0; timeout -s KILL 120 /tmp/uar-silent > /tmp/uar-silent.log 2>&1 || st=$?; \
+    if [ "$st" != 134 ] || grep -qv "^Aborted" /tmp/uar-silent.log; then \
+      echo "the silent sealed link did not die by SIGABRT with no output (exit $st):" >&2; \
+      cat /tmp/uar-silent.log >&2; exit 1; \
+    fi; \
+    for t in ok:5 never:7; do \
+      st=0; out=$(timeout -s KILL 120 /tmp/uar-${t%%:*} 2>&1) || st=$?; \
+      if [ "$st" != 0 ] || [ "$out" != "${t#*:}" ]; then \
+        echo "uar-${t%%:*} did not exit 0 with \"${t#*:}\" (exit $st): $out" >&2; exit 1; \
+      fi; \
+    done; \
+    echo "stack-use-after-return is reported in the sealed configs; a correct program and the -fsanitize-address-use-after-return=never control do not report"
 
 # MemorySanitizer test, on the targets that have an msan runtime (x86_64 and
 # aarch64; on the others section 5b wrote no msan config and this step says so

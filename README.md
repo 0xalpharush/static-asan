@@ -237,17 +237,38 @@ not built with MemorySanitizer. MSan needs every instruction that touches memory
 instrumented, so C++ that uses libc++ (`std::string` included) reports
 `use-of-uninitialized-value` for correct code. Use the MSan configs for C.
 
+### What a sealed ASan binary checks
+
+A sealed binary reads no environment (patch 0012), so `ASAN_OPTIONS` does not change what
+it checks. Its flags are the runtime's defaults, then the program's own
+`__asan_default_options()`, then the flags that `SealFlags()` pins: the signal handlers,
+`use_sigaltstack`, the core dump, leak detection, the RSS limits, the heap profile, the
+release interval, `abort_on_error`, `clear_shadow_mmap_threshold` and
+`protect_shadow_gap`. None of those is a check below, so each check below has its
+compiler-rt 20.1.8 default unless the program sets it. We measured
+each with `asan-musl-sealed.cfg` at `-Os`, on x86_64 natively and on riscv64 under
+`qemu-user`, with the same results on both.
+
+| Flag | Default | In a sealed binary |
+| --- | --- | --- |
+| `detect_stack_use_after_return` | 1 | A read through a pointer to a local of a returned frame reports `stack-use-after-return` (exit 134). clang's default `-fsanitize-address-use-after-return=runtime` makes each instrumented frame read this flag, and start-up maps the main thread's fake stack: one `mmap` with no address hint, 11571200 bytes. Section 6 of the Dockerfile checks the report. |
+| `quarantine_size_mb`, `thread_local_quarantine_size_kb` | 256, 1024 | A freed block is not handed out again until about 226MiB more has been freed after it: after 237,010,688 bytes of 64-byte frees on x86_64, and 236,995,328 on riscv64. Until then a use of the block reports `heap-use-after-free`. |
+| `detect_container_overflow`, `alloc_dealloc_mismatch`, `new_delete_type_mismatch` | 1 | `container-overflow`, `alloc-dealloc-mismatch` and `new-delete-type-mismatch` are reported (exit 134). |
+| `strict_string_checks` | 0 | `atoi`, `strtol`, `strchr` and the other string interceptors check the bytes that the function read. With 1 they check the whole string, up to its NUL, and `strndup(p, n)` then reports when the `n` bytes at `p` hold no NUL, which C allows. |
+| `detect_invalid_pointer_pairs` | 0 | Needs `-fsanitize=pointer-compare,pointer-subtract` as well. With both, a comparison or subtraction of two pointers reports when any poisoned byte lies between them, container-overflow poison included, so every `push_back` into a `std::vector` with spare capacity reports. |
+| `check_initialization_order` | 0 | With 1, a dynamic initializer that reads another unit's global before that unit's initializer has run reports `initialization-order-fiasco`. At `-Os` it also reports a read of a global whose dynamic initializer clang folded to a constant: that unit then runs no initializer, and its globals stay poisoned. |
+
 ## Cross-building
 
 The image runs on the build machine and compiles for the target. The base image is
 pinned to `$BUILDPLATFORM`, and the three arguments above name the target. You do not
 need target hardware or an emulator to build the image.
 
-Five verification steps at the end of the Dockerfile run target binaries; the fifth,
+Six verification steps at the end of the Dockerfile run target binaries; the sixth,
 the MemorySanitizer check, exists only on x86_64 and aarch64. On a cross build, the
 build machine must be able to run them. On Linux, register `qemu-user` with
 `binfmt_misc` for the target, for example with the `qemu-user-static` package or with
-`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these five steps
+`docker run --privileged tonistiigi/binfmt --install <arch>`. Only these six steps
 need the emulator. The MSan check detects the emulator and does not run its binaries
 under it. With the default `VERIFY_RUNTIME=require` that fails the build; with
 `VERIFY_RUNTIME=defer` the check records them in
@@ -375,8 +396,10 @@ The [CI](.github/workflows/ci.yml) workflow builds the image for each of the fou
 targets on each push to `main`, on each pull request and once a week. The last steps of
 `toolchain/Dockerfile` are the tests. A static musl binary runs, a static ASan binary
 reports an overflow that only a live interceptor can report, a link without the wrap
-list fails, and a sealed ASan C++ program reports a `std::string` container-overflow
-while a correct one does not. On x86_64 and aarch64 an MSan step follows: it runs a clean program
+list fails, a sealed ASan C++ program reports a `std::string` container-overflow
+while a correct one does not, and a sealed ASan program reports a stack use-after-return
+while a correct one and a control built with `-fsanitize-address-use-after-return=never`
+do not. On x86_64 and aarch64 an MSan step follows: it runs a clean program
 and an uninitialized-read program, each linked plain and sealed, twelve times each,
 requires at least one pass of each and accepts no outcome other than a pass or a
 known miss (the sealed spin above, or the re-exec that the build's seccomp profile
