@@ -41,23 +41,24 @@
 # 128GB, so the two verification steps below that run an ASan binary (the
 # interceptor check and the std::string check) need a container whose RLIMIT_AS
 # is not small.  The others do not: the plain static musl link runs, the link
-# that must fail still fails, and the MSan step runs but skips, printing "no msan
-# test", because riscv64 has no msan runtime and so no MSan config.  A 32-bit
-# target needs none of that -- its shadow is about 512MiB.  See the "Running an
-# emulated image" section of README.md.
+# that must fail still fails, and the MSan step runs (riscv64's MSan layout,
+# patch 0029, needs a 47-bit user address space: Sv48 hardware, or qemu-user 10
+# or later).  A 32-bit target needs none of that -- its shadow is about 512MiB.
+# See the "Running an emulated image" section of README.md.
 #
 # Six of the steps at the end run binaries for the target; one of them, the
-# MemorySanitizer test, only on x86_64 and aarch64, the targets with an msan
-# runtime.  On a native build that is nothing to arrange; on a cross build the
+# MemorySanitizer test, only on x86_64, aarch64 and riscv64, the targets with an
+# msan runtime.  On a native build that is nothing to arrange; on a cross build the
 # machine has to be able to execute them, which on Linux means binfmt_misc with
 # qemu-user registered -- `docker run --privileged tonistiigi/binfmt --install
 # <arch>` once per boot, or docker/setup-qemu-action in CI.  Only these six
-# steps need it.  Nothing the image is for does.  MSan cannot run under
-# qemu-user at all (qemu places the guest stack inside MSan's fixed ranges), so
-# the MSan step detects emulation and does not run its binaries; it treats that
-# as a deferral, through VERIFY_RUNTIME like the ASan check: the default,
-# "require", fails the build, and "defer" records the MSan runs as not
-# verified.  Build aarch64 natively to have MSan checked; see that step.
+# steps need it.  Nothing the image is for does.  x86_64 and aarch64 MSan cannot
+# run under qemu-user at all (qemu places the guest stack inside MSan's fixed
+# ranges), so on those two the MSan step detects emulation and does not run its
+# binaries; it treats that as a deferral, through VERIFY_RUNTIME like the ASan
+# check: the default, "require", fails the build, and "defer" records the MSan
+# runs as not verified.  Build aarch64 natively to have MSan checked; see that
+# step.  riscv64 MSan runs under qemu-user 10 or later; see that step too.
 #
 # Sources are taken from the mounted checkouts at their pinned base commits with
 # git archive, unpacked into the image and patched there, so the patch series is
@@ -112,8 +113,8 @@
 #   /opt/asan-static/msan-musl.cfg     clang config: static musl + MemorySanitizer,
 #                                      with libclang_rt.msan.a.wrap.  Emitted only
 #                                      on the targets whose msan runtime the build
-#                                      produced (x86_64, aarch64); the other
-#                                      targets have none -- see section 5b
+#                                      produced (x86_64, aarch64, riscv64); the
+#                                      other target has none -- see section 5b
 #   /opt/asan-static/msan-musl-sealed.cfg
 #                                      clang config: the same static MSan link
 #                                      with sealed init turned on.  Same runtime
@@ -160,7 +161,7 @@ ARG VPTR_TRAP=/opt/ubsan-vptr-trap
 # Extra target flags threaded through every component that ends up inside a link
 # this image makes: musl, libunwind, the three libc++ builds, both compiler-rt
 # builds, the vptr handler, and the config files (nine, and two more for MSan on
-# x86_64 and aarch64).  Empty by default, so an image built without it is the
+# x86_64, aarch64 and riscv64).  Empty by default, so an image built without it is the
 # stock one.
 #
 # It exists for a target whose ISA subset is part of what the produced binary
@@ -1259,9 +1260,32 @@ RUN set -eu; \
 # The same static-musl link as asan-musl.cfg / asan-musl-sealed.cfg, with
 # -fsanitize=memory and msan's own wrap list.  Emitted only where the build
 # produced an msan runtime: compiler-rt builds msan for the architectures in
-# ALL_MSAN_SUPPORTED_ARCH, which here are x86_64 and aarch64.  The other targets
-# have no msan runtime in compiler-rt 20.1.8, so there is nothing to point a
-# config at and this step skips them.
+# ALL_MSAN_SUPPORTED_ARCH, which here are x86_64, aarch64 and, with patch 0029,
+# riscv64.  armv7 has no msan runtime in compiler-rt 20.1.8, so there is nothing
+# to point a config at and this step skips it.
+#
+# riscv64 gets one more line, and it is the compiler half of the change whose
+# runtime half is patch 0029 (llvm/llvm-project#235906).  The clang in this
+# image is Alpine's 20.1.8, which has no MemorySanitizer mapping for riscv64:
+# MemorySanitizer::initializeModule reaches report_fatal_error("unsupported
+# architecture") on every riscv64 module.  Before it looks at the triple,
+# though, it checks whether -msan-shadow-base or -msan-origin-base was given,
+# and if either was it takes all four mapping constants from the -msan-*
+# options instead.  The two options below are #235906's riscv64 constants,
+# which are LoongArch64's -- and-mask 0, xor-mask 0x500000000000, shadow-base
+# 0, origin-base 0x100000000000, the two zeros being the options' defaults --
+# and they are the layout patch 0029 gives the runtime.  Measured on this
+# clang: with the two options, -O1 IR and objects, with and without
+# -fsanitize-memory-track-origins=2, are byte-identical to those of a clang
+# 20.1.8 built with #235906's MemorySanitizer.cpp hunk and given no options,
+# for zstd's zstd_decompress.c and zstd_decompress_block.c, cgif.c, and three
+# small files (an uninitialized read, varargs, struct copies).  With
+# -msan-xor-mask alone the override is not taken and the compile still fails.
+# The options are written into the configs rather than left to the caller
+# because a riscv64 -fsanitize=memory compile without them does not compile.
+# On x86_64 and aarch64 the line is not written, so their configs are as they
+# were.  When a clang with #235906 replaces this one, the line and patch 0029
+# can both go.
 RUN set -eu; \
     rtdir=$(clang --target="$TRIPLE" -resource-dir="$STATIC_RESOURCE_DIR" \
               -print-runtime-dir); \
@@ -1272,6 +1296,10 @@ RUN set -eu; \
       exit 0; \
     fi; \
     [ -f "$mwrap" ] || { echo "msan runtime without a wrap list at $mwrap"; exit 1; }; \
+    case "$TRIPLE" in \
+      riscv64-*) mmap="-mllvm -msan-xor-mask=0x500000000000 -mllvm -msan-origin-base=0x100000000000" ;; \
+      *)         mmap= ;; \
+    esac; \
     mkdir -p /opt/asan-static \
  && printf '%s\n' \
       "# Static musl with MemorySanitizer." \
@@ -1284,6 +1312,7 @@ RUN set -eu; \
       "--unwindlib=libunwind" \
       "-fuse-ld=lld" \
       "-fsanitize=memory" \
+      ${mmap:+"$mmap"} \
       "-static" \
       "-Wl,--gc-sections" \
       "-Wl,--no-warn-backrefs" \
@@ -1302,6 +1331,7 @@ RUN set -eu; \
       "--unwindlib=libunwind" \
       "-fuse-ld=lld" \
       "-fsanitize=memory" \
+      ${mmap:+"$mmap"} \
       "-static" \
       "-Wl,--gc-sections" \
       "-Wl,--no-warn-backrefs" \
@@ -1486,9 +1516,9 @@ RUN set -eu; \
       echo "std::string container-overflow is reported; a correct program does not report"; \
     fi
 
-# MemorySanitizer test, on the targets that have an msan runtime (x86_64 and
-# aarch64; on the others section 5b wrote no msan config and this step says so
-# and does nothing).
+# MemorySanitizer test, on the targets that have an msan runtime (x86_64,
+# aarch64 and riscv64; on armv7 section 5b wrote no msan config and this step
+# says so and does nothing).
 #
 # Two programs, each linked with msan-musl.cfg (plain) and msan-musl-sealed.cfg
 # (sealed), so four binaries:
@@ -1532,21 +1562,25 @@ RUN set -eu; \
 #               "((personality(old_personality | 0x0040000))) != ((-1))"
 #   as-limit  MSan's own "can not mmap the shadow" / "Cannot protect memory
 #             range", accepted only when this build's RLIMIT_AS is not
-#             unlimited -- the shadow is TBs.
+#             unlimited -- the shadow is TBs -- or on riscv64, whose layout
+#             (patch 0029) needs a 47-bit user address space that Sv39
+#             hardware and a qemu-user older than 10 do not give it.  On
+#             riscv64 a plain re-exec counts as that kind of miss too.
 #
 # Anything else -- another signal, another exit status, a report missing or
 # where none belongs, a CHECK other than that one -- fails the build at once.
 # And at least one run of each binary must pass: with a spin or re-exec share
 # of about one in four, twelve runs that all miss happen about once in 17
-# million builds.  Only when no run passed AND the build's RLIMIT_AS is set
-# AND the misses were the address-space kind (as-limit, or a sealed spin,
+# million builds.  Only when no run passed AND the build's RLIMIT_AS is set (or
+# the target is riscv64) AND the misses were the address-space kind (as-limit, or a sealed spin,
 # which is what a refused reservation looks like) is the miss a property of
 # the machine rather than the toolchain; that goes through VERIFY_RUNTIME
 # exactly as the ASan check above does: "require" fails the build saying so,
 # "defer" appends what was not verified to /opt/asan-static/RUNTIME-UNVERIFIED.
 #
-# MSan does not run under qemu-user at all: on aarch64 qemu-user puts the guest
-# stack inside MSan's origin range, and both the plain and the sealed runs fail.
+# x86_64 and aarch64 MSan does not run under qemu-user at all: on aarch64
+# qemu-user puts the guest stack inside MSan's origin range, and both the plain
+# and the sealed runs fail.
 # So the step first runs a static probe and reads /proc/<pid>/exe from outside
 # it: natively that is the probe itself, under binfmt_misc it is the emulator.
 # If that link cannot be read at all, the step cannot tell which, and says so
@@ -1554,13 +1588,29 @@ RUN set -eu; \
 # passing, and the miss goes through VERIFY_RUNTIME like the others, by one
 # helper, deferral(): "require" fails the build saying so, "defer" appends to
 # RUNTIME-UNVERIFIED that MSan was not verified.
-# The targets without an msan runtime (riscv64, armv7) skip this step before
-# the probe.  CI builds aarch64 on a native arm64 runner, so CI runs these
-# binaries for real.
+# riscv64 is the exception: there is no riscv64 runner to build on natively,
+# and its layout holds under qemu-user 10 and later, which leave the 47-bit
+# layout free.  So on riscv64 the step names the emulator and runs the
+# binaries under it, and a qemu that does not leave the layout free shows up as
+# the address-space misses above.  Measured: qemu 8.2.2 (Ubuntu 24.04's
+# qemu-user-static) answers the program's first mmap(NULL) with an address in
+# shadow-3, so in a RUN step every plain run re-execs and is refused, and
+# every sealed run spins.  armv7, which has no msan runtime, skips this step before the probe.
+# CI builds aarch64 on a native arm64 runner and riscv64 under the qemu-user
+# that docker/setup-qemu-action registers, so CI runs these binaries for real.
+#
+# Then the same umr program, linked with asan-musl-sealed.cfg, must exit 0
+# with no report: an uninitialized read is the class that MSan catches and
+# ASan does not.  It runs once, as the ASan checks above do; under a set
+# RLIMIT_AS, where a sealed ASan binary spins, it is not run, through
+# deferral().
 #
 # Last, a negative link: the clean program against the statically intercepting
 # resource dir, with --gc-sections as both MSan configs pass it, and WITHOUT the
-# wrap list.  It must fail on __msan_wrap_list_present (patch 0024).
+# wrap list.  It must fail on __msan_wrap_list_present (patch 0024).  It is
+# given the configs' -mllvm line (riscv64's mapping, section 5b; there is none
+# elsewhere), or on riscv64 it would stop at the compile and never reach the
+# link.
 ARG MSAN_RUNS=12
 RUN set -eu; \
     [ -f /opt/asan-static/msan-musl.cfg ] || { echo "no msan config for $TRIPLE; no msan test"; exit 0; }; \
@@ -1596,8 +1646,9 @@ RUN set -eu; \
     clang --config=/opt/asan-static/msan-musl.cfg        -g /tmp/msan_umr.c   -o /tmp/msan_umr; \
     clang --config=/opt/asan-static/msan-musl-sealed.cfg -g /tmp/msan_umr.c   -o /tmp/msan_umr_sealed; \
     echo "msan configs link"; \
+    mmap=$(grep '^-mllvm ' /opt/asan-static/msan-musl.cfg || true); \
     if clang --target="$TRIPLE" --sysroot="$SYSROOT" -resource-dir="$STATIC_RESOURCE_DIR" \
-         --rtlib=compiler-rt --unwindlib=libunwind -fuse-ld=lld -fsanitize=memory -static \
+         --rtlib=compiler-rt --unwindlib=libunwind -fuse-ld=lld -fsanitize=memory $mmap -static \
          -Wl,--gc-sections /tmp/msan_clean.c -o /tmp/msan_detached 2>/tmp/msan_detached.log; then \
       echo "an msan link without the wrap list succeeded; the interceptors are detached" >&2; exit 1; \
     fi; \
@@ -1621,7 +1672,9 @@ RUN set -eu; \
     clang --config=/opt/asan-static/musl.cfg /tmp/msan_probe.c -o /tmp/msan_probe; \
     /tmp/msan_probe & probe=$!; sleep 1; \
     probe_exe=$(readlink "/proc/$probe/exe" || true); kill -9 "$probe"; wait "$probe" 2>/dev/null || true; \
-    if [ -z "$probe_exe" ]; then \
+    if [ "$probe_exe" != /tmp/msan_probe ] && [ "${TRIPLE%%-*}" = riscv64 ]; then \
+      echo "msan: riscv64 binaries run through ${probe_exe:-a runner this build cannot name}; riscv64's layout needs qemu-user 10 or later"; \
+    elif [ -z "$probe_exe" ]; then \
       deferral "every run (clean and umr, plain and sealed)" \
         "The build could not read /proc/<pid>/exe of a probe, so it could not tell whether the target's binaries run natively, and none was run." \
         "  This build could not read /proc/$probe/exe of a static probe, so it" \
@@ -1631,8 +1684,7 @@ RUN set -eu; \
         "  in this image has not been tested either way.  The compiles and links" \
         "  succeeded."; \
       exit 0; \
-    fi; \
-    if [ "$probe_exe" != /tmp/msan_probe ]; then \
+    elif [ "$probe_exe" != /tmp/msan_probe ]; then \
       deferral "every run (clean and umr, plain and sealed)" \
         "The build ran the target's binaries through $probe_exe (binfmt_misc emulation), under which MSan's fixed layout does not hold, so none was run." \
         "  This build runs the target's binaries through $probe_exe" \
@@ -1645,6 +1697,7 @@ RUN set -eu; \
     fi; \
     ulimit -v unlimited 2>/dev/null || true; \
     vlimit=$(ulimit -v); \
+    case "$vlimit:$TRIPLE" in unlimited:riscv64-*) asmiss=va ;; unlimited:*) asmiss= ;; *) asmiss=rlimit ;; esac; \
     reexec_re='MemorySanitizer: CHECK failed: msan_linux\.cpp:[0-9]+ "\(\(personality\(old_personality \| 0x0040000\)\)\) != \(\(-1\)\)"'; \
     aslimit_re='FATAL: MemorySanitizer can not mmap the shadow memory|FATAL: MemorySanitizer: Cannot protect memory range'; \
     msan_check() { \
@@ -1662,7 +1715,7 @@ RUN set -eu; \
           spin=$((spin + 1)); \
         elif [ "$mode" = plain ] && grep -qE "$reexec_re" /tmp/msan_run.log; then \
           reexec=$((reexec + 1)); \
-        elif [ "$vlimit" != unlimited ] && grep -qE "$aslimit_re" /tmp/msan_run.log; then \
+        elif [ -n "$asmiss" ] && grep -qE "$aslimit_re" /tmp/msan_run.log; then \
           aslim=$((aslim + 1)); \
         else \
           echo "$label: run $n of $MSAN_RUNS ended with status $rc, which is neither a pass nor a known miss:" >&2; \
@@ -1671,8 +1724,20 @@ RUN set -eu; \
       done; \
       echo "$label: $n runs: $pass passed, $spin spun (sealed), $reexec re-exec refused (plain), $aslim address-space limit"; \
       [ "$pass" -gt 0 ] && return 0; \
-      if [ "$vlimit" = unlimited ] || [ $((spin + aslim)) -eq 0 ]; then \
+      miss=$((spin + aslim)); [ "$asmiss" = va ] && miss=$((miss + reexec)); \
+      if [ -z "$asmiss" ] || [ "$miss" -eq 0 ]; then \
         echo "$label: no run of $MSAN_RUNS passed, and a constrained address space is not why" >&2; exit 1; \
+      fi; \
+      if [ "$asmiss" = va ]; then \
+        deferral "$label" \
+          "The build ran on riscv64 with no RLIMIT_AS and no run of it passed: $spin spun, $aslim could not map the shadow, $reexec re-exec refused." \
+          "  No run of $label passed, so whether MemorySanitizer works in it has not" \
+          "  been tested either way.  riscv64's MSan layout (patch 0029) needs a" \
+          "  47-bit user address space: Sv48 hardware, or qemu-user 10 or later." \
+          "  On Sv39 hardware, or under an older qemu-user, a plain binary finds" \
+          "  the layout taken and re-execs or cannot map its shadow, and a sealed" \
+          "  one spins on its refused reservation."; \
+        return 0; \
       fi; \
       deferral "$label" \
         "The build ran under an RLIMIT_AS of ${vlimit}KB and no run of it passed: $spin spun, $aslim could not map the shadow." \
@@ -1687,7 +1752,19 @@ RUN set -eu; \
     msan_check umr/plain    /tmp/msan_umr          umr   plain; \
     msan_check clean/sealed /tmp/msan_clean_sealed clean sealed; \
     msan_check umr/sealed   /tmp/msan_umr_sealed   umr   sealed; \
-    echo "msan: every run passed or missed in a known way"
+    echo "msan: every run passed or missed in a known way"; \
+    clang --config=/opt/asan-static/asan-musl-sealed.cfg -g /tmp/msan_umr.c -o /tmp/msan_umr_asan; \
+    if [ "$vlimit" != unlimited ]; then \
+      deferral "umr under asan-musl-sealed.cfg" \
+        "The build ran under an RLIMIT_AS of ${vlimit}KB, under which a sealed ASan binary spins, so it was not run." \
+        "  The uninitialized read linked with asan-musl-sealed.cfg was not run:" \
+        "  this build's address space limit is ${vlimit}KB."; \
+    else \
+      rc=0; timeout -s KILL 60 /tmp/msan_umr_asan > /tmp/msan_run.log 2>&1 || rc=$?; \
+      { [ "$rc" -eq 0 ] && grep -qx "[12]" /tmp/msan_run.log && [ "$(wc -l < /tmp/msan_run.log)" -eq 1 ]; } \
+        || { echo "umr/asan-sealed: status $rc, not exit 0 with no report:" >&2; cat /tmp/msan_run.log >&2; exit 1; }; \
+      echo "umr/asan-sealed: exit 0, no report: an uninitialized read is a class only MSan catches"; \
+    fi
 
 # The last two steps check sections 4c and 4d, with programs that are static,
 # not position-independent and not ASan, like /tmp/hello in the first step, so
