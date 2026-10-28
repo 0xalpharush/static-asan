@@ -261,7 +261,7 @@ checks call and the cache that they read. The handler makes compiler-rt's decisi
 on a mismatch, executes the trap instruction, so a bad downcast or a member call on an object of
 another dynamic type ends as a trap-mode check does. Before it reads the vtable, the type
 information and the base-class lists, it checks that each address lies inside the program's
-image, and it reads no address outside it: a vtable outside it is a mismatch, and a class whose
+image, and apart from the object's own storage, it reads no address outside the image: a vtable outside it is a mismatch, and a class whose
 type information or base-class list lies outside it ends that branch of the search of the base
 classes. It makes no syscall for this. It does
 not check the object's own storage, which compiler-rt does not check either. Its search of the

@@ -32,7 +32,7 @@
 // bound is exact here and asks the kernel nothing.  That covers the vtable
 // prefix, each type_info node of the walk, the vptr of each node and the
 // type_info and name string it leads to, and each node's whole base-class
-// array.  It reads no address outside the image, where reading could fault: at
+// array.  Apart from the object's own storage, it reads no address outside the image, where reading could fault: at
 // the vtable or its prefix such an address is a mismatch, and traps; at a node
 // of the walk it ends that branch of the search, as a limit does (below).  Two
 // reads are not tested: the object's own storage, which
