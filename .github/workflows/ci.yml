@@ -273,7 +273,7 @@ jobs:
           for target in cgif_file_fuzzer cgif_fuzzer cgif_rgb_fuzzer; do
             plain="e2e-out/out/$target/$target.plain"
             msan="e2e-out/out/$target/$target.msan"
-            readelf -sW "$msan" | grep -q __msan_init
+            readelf -sW "$msan" | grep __msan_init >/dev/null
             set +e
             timeout 60 "$plain" e2e-input > "$target.plain.stdout" 2> "$target.plain.stderr"
             plain_rc=$?
