@@ -448,9 +448,8 @@ while a correct one does not. On x86_64, aarch64 and riscv64 an MSan step follow
 and an uninitialized-read program, each linked plain and sealed, twelve times each,
 requires at least one pass of each and accepts no outcome other than a pass or a
 known miss (the sealed spin above, or the re-exec that the build's seccomp profile
-refuses), requires that the same uninitialized-read program linked with
-`asan-musl-sealed.cfg` exits 0 with no report, and requires that an MSan link with
-`--gc-sections` and without the wrap list fails. Then the hardened libc++ traps on a broken precondition and the default one
+refuses), and requires that an MSan link with `--gc-sections` and without the wrap
+list fails. Then the hardened libc++ traps on a broken precondition and the default one
 does not, and the vptr handler traps on a bad downcast while a correct program runs and a
 link without it fails. x86_64 and aarch64 build on runners of their own architecture
 (`ubuntu-24.04` and `ubuntu-24.04-arm`), so these steps run natively. riscv64 and

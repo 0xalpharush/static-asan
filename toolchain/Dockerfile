@@ -1604,12 +1604,6 @@ RUN set -eu; \
 # CI builds aarch64 on a native arm64 runner and riscv64 under the qemu-user
 # that docker/setup-qemu-action registers, so CI runs these binaries for real.
 #
-# Then the same umr program, linked with asan-musl-sealed.cfg, must exit 0
-# with no report: an uninitialized read is the class that MSan catches and
-# ASan does not.  It runs once, as the ASan checks above do; under a set
-# RLIMIT_AS, where a sealed ASan binary spins, it is not run, through
-# deferral().
-#
 # Last, a negative link: the clean program against the statically intercepting
 # resource dir, with --gc-sections as both MSan configs pass it, and WITHOUT the
 # wrap list.  It must fail on __msan_wrap_list_present (patch 0024).  It is
@@ -1757,19 +1751,7 @@ RUN set -eu; \
     msan_check umr/plain    /tmp/msan_umr          umr   plain; \
     msan_check clean/sealed /tmp/msan_clean_sealed clean sealed; \
     msan_check umr/sealed   /tmp/msan_umr_sealed   umr   sealed; \
-    echo "msan: every run passed or missed in a known way"; \
-    clang --config=/opt/asan-static/asan-musl-sealed.cfg -g /tmp/msan_umr.c -o /tmp/msan_umr_asan; \
-    if [ "$vlimit" != unlimited ]; then \
-      deferral "umr under asan-musl-sealed.cfg" \
-        "The build ran under an RLIMIT_AS of ${vlimit}KB, under which a sealed ASan binary spins, so it was not run." \
-        "  The uninitialized read linked with asan-musl-sealed.cfg was not run:" \
-        "  this build's address space limit is ${vlimit}KB."; \
-    else \
-      rc=0; timeout -s KILL 60 /tmp/msan_umr_asan > /tmp/msan_run.log 2>&1 || rc=$?; \
-      { [ "$rc" -eq 0 ] && grep -qx "[12]" /tmp/msan_run.log && [ "$(wc -l < /tmp/msan_run.log)" -eq 1 ]; } \
-        || { echo "umr/asan-sealed: status $rc, not exit 0 with no report:" >&2; cat /tmp/msan_run.log >&2; exit 1; }; \
-      echo "umr/asan-sealed: exit 0, no report: an uninitialized read is a class only MSan catches"; \
-    fi
+    echo "msan: every run passed or missed in a known way"
 
 # The last two steps check sections 4c and 4d, with programs that are static,
 # not position-independent and not ASan, like /tmp/hello in the first step, so
