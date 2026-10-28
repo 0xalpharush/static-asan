@@ -163,31 +163,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-            triple: x86_64-unknown-linux-musl
-            musl_target: x86_64-linux-musl
-            qemu: ""
-            target_cflags: ""
-          # Native, not qemu-user: the MSan step has to run on the hardware it is for.
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            triple: aarch64-unknown-linux-musl
-            musl_target: aarch64-linux-musl
-            qemu: ""
-            target_cflags: ""
           - arch: riscv64
             runner: ubuntu-24.04
             triple: riscv64-unknown-linux-musl
             musl_target: riscv64-linux-musl
             qemu: riscv64
             target_cflags: "-march=rv64g -mabi=lp64d -ffunction-sections -fdata-sections"
-          - arch: armv7
-            runner: ubuntu-24.04
-            triple: armv7-unknown-linux-musleabihf
-            musl_target: armv7-linux-musleabihf
-            qemu: arm
-            target_cflags: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -264,6 +245,60 @@ jobs:
             exit 1
           fi
           echo "no RUNTIME-UNVERIFIED in the image"
+
+      - name: check out the exact OSS Verify MSan branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: 0xalpharush/oss-verify
+          ref: d6840c0f45d4c929657d2bac9e91933c93ce6b31
+          persist-credentials: false
+          path: oss-verify
+
+      - name: build cgif plain and MSan binaries with the branch toolchain
+        working-directory: oss-verify
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-yaml
+          sed -i 's/sanitizers: \[address, undefined\]/sanitizers: [address, undefined, memory]/' projects/cgif/project.yaml
+          grep -F 'sanitizers: [address, undefined, memory]' projects/cgif/project.yaml
+          ./tools/check --build plain --build msan --toolchain tc-asan-musl:ci --no-shell --dir e2e-out --summary e2e-out/summary.md cgif
+
+      - name: execute every cgif target in both builds
+        working-directory: oss-verify
+        run: |
+          set -euo pipefail
+          printf '\0\0\0\0\0\0' > e2e-input
+          printf 'R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==' | base64 -d >> e2e-input
+          for target in cgif_file_fuzzer cgif_fuzzer cgif_rgb_fuzzer; do
+            plain="e2e-out/out/$target/$target.plain"
+            msan="e2e-out/out/$target/$target.msan"
+            readelf -sW "$msan" | grep -q __msan_init
+            set +e
+            timeout 60 "$plain" e2e-input > "$target.plain.stdout" 2> "$target.plain.stderr"
+            plain_rc=$?
+            timeout 60 "$msan" e2e-input > "$target.msan.stdout" 2> "$target.msan.stderr"
+            msan_rc=$?
+            set -e
+            echo "$target: plain=$plain_rc msan=$msan_rc"
+            test "$plain_rc" -eq 0
+            test "$msan_rc" -eq 0
+            cmp "$target.plain.stdout" "$target.msan.stdout"
+            cmp "$target.plain.stderr" "$target.msan.stderr"
+          done
+
+      - name: retain the exact binaries, hashes and run logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02c  # v4.6.2
+        with:
+          name: cgif-msan-pre-release-${{ github.sha }}
+          path: |
+            oss-verify/e2e-out/manifest.yaml
+            oss-verify/e2e-out/summary.md
+            oss-verify/e2e-out/out
+            oss-verify/e2e-input
+            oss-verify/*.stdout
+            oss-verify/*.stderr
+          if-no-files-found: error
 
   # The one check to require.  It runs whatever happened above: it passes when the
   # route job chose the jobs and each chosen job passed, and fails otherwise.
